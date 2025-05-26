@@ -18,6 +18,8 @@ from pydantic import BaseModel, Field
 from typing import Generator
 from llm_processor import get_llm_processor
 from datetime import datetime, timedelta
+import soundfile as sf
+import io
 
 # Configure logging
 logging.basicConfig(
@@ -25,6 +27,10 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Ensure recordings directory exists
+RECORDINGS_DIR = "recordings"
+os.makedirs(RECORDINGS_DIR, exist_ok=True)
 
 # Pydantic models for request and response schemas
 class ReadabilityRequest(BaseModel):
@@ -65,6 +71,9 @@ class AudioProcessor:
     def __init__(self, target_sample_rate=24000):
         self.target_sample_rate = target_sample_rate
         self.source_sample_rate = 48000  # Most common sample rate for microphones
+        self.current_session_id = None
+        self.current_transcription = []
+        self.audio_buffer = []  # Add audio buffer as instance variable
         
     def process_audio_chunk(self, audio_data):
         # Convert binary audio data to Int16 array
@@ -82,15 +91,63 @@ class AudioProcessor:
         
         # Convert back to int16 while preserving amplitude
         resampled_int16 = (resampled_data * 32768.0).clip(-32768, 32767).astype(np.int16)
-        return resampled_int16.tobytes()
+        processed_audio = resampled_int16.tobytes()
+        
+        # Store the processed audio in our buffer
+        self.audio_buffer.append(processed_audio)
+        
+        return processed_audio
 
-    def save_audio_buffer(self, audio_buffer, filename):
-        with wave.open(filename, 'wb') as wf:
+    def start_new_session(self):
+        """Start a new recording session with a unique timestamp-based ID"""
+        self.current_session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.current_transcription = []
+        self.audio_buffer = []  # Clear audio buffer for new session
+        return self.current_session_id
+
+    def add_transcription_text(self, text):
+        """Add transcription text to the current session"""
+        if self.current_session_id:
+            self.current_transcription.append(text)
+
+    def save_audio_buffer(self, session_id=None):
+        """Save the audio buffer as a WAV file"""
+        if not session_id:
+            session_id = self.current_session_id
+        
+        if not session_id:
+            logger.warning("No session ID provided for audio save")
+            return
+        
+        if not self.audio_buffer:
+            logger.warning("No audio data to save")
+            return
+            
+        wav_path = os.path.join(RECORDINGS_DIR, f"{session_id}.wav")
+        with wave.open(wav_path, 'wb') as wf:
             wf.setnchannels(1)  # Mono audio
             wf.setsampwidth(2)  # 2 bytes per sample (16-bit)
             wf.setframerate(self.target_sample_rate)
-            wf.writeframes(b''.join(audio_buffer))
-        logger.info(f"Saved audio buffer to {filename}")
+            wf.writeframes(b''.join(self.audio_buffer))
+        
+        logger.info(f"Saved audio recording to {wav_path}")
+
+    def save_transcription(self, session_id=None):
+        """Save the transcription as a text file with UTF-8-BOM encoding for Windows compatibility"""
+        if not session_id:
+            session_id = self.current_session_id
+        
+        if not session_id or not self.current_transcription:
+            logger.warning("No session ID or transcription available")
+            return
+        
+        txt_path = os.path.join(RECORDINGS_DIR, f"{session_id}.txt")
+        with open(txt_path, 'wb') as f:  # Open in binary mode
+            # Write UTF-8 BOM
+            f.write(b'\xef\xbb\xbf')
+            # Write content encoded as UTF-8
+            f.write(''.join(self.current_transcription).encode('utf-8'))
+        logger.info(f"Saved transcription to {txt_path} with UTF-8-BOM encoding")
 
 @app.websocket("/api/v1/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -106,7 +163,6 @@ async def websocket_endpoint(websocket: WebSocket):
     
     client = None
     audio_processor = AudioProcessor()
-    audio_buffer = []
     recording_stopped = asyncio.Event()
     openai_ready = asyncio.Event()
     pending_audio_chunks = []
@@ -125,6 +181,9 @@ async def websocket_endpoint(websocket: WebSocket):
             client = OpenAIRealtimeAudioTextClient(os.getenv("OPENAI_API_KEY"))
             await client.connect()
             logger.info("Successfully connected to OpenAI client")
+            
+            # Start a new recording session
+            audio_processor.start_new_session()
             
             # Register handlers after client is initialized
             client.register_handler("session.updated", lambda data: handle_generic_event("session.updated", data))
@@ -161,9 +220,11 @@ async def websocket_endpoint(websocket: WebSocket):
     async def handle_text_delta(data):
         try:
             if websocket.client_state == WebSocketState.CONNECTED:
+                text_delta = data.get("delta", "")
+                audio_processor.add_transcription_text(text_delta)
                 await websocket.send_text(json.dumps({
                     "type": "text",
-                    "content": data.get("delta", ""),
+                    "content": text_delta,
                     "isNewResponse": False
                 }))
                 logger.info("Handled response.text.delta")
@@ -194,6 +255,10 @@ async def websocket_endpoint(websocket: WebSocket):
         
         if client:
             try:
+                # Save the audio and transcription files
+                audio_processor.save_audio_buffer()
+                audio_processor.save_transcription()
+                
                 await client.close()
                 client = None
                 openai_ready.clear()
@@ -203,7 +268,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 }))
                 logger.info("Connection closed after response completion")
             except Exception as e:
-                logger.error(f"Error closing client after response done: {str(e)}")
+                logger.error(f"Error in handle_response_done: {str(e)}", exc_info=True)
 
     async def handle_generic_event(event_type, data):
         logger.info(f"Handled {event_type} with data: {json.dumps(data, ensure_ascii=False)}")
@@ -345,7 +410,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     continue
                 
                 # Append the processed audio to the buffer
-                audio_buffer.append(processed_audio)
+                audio_processor.audio_buffer.append(processed_audio)
 
                 await client.send_audio(processed_audio)
                 logger.info(f"Audio chunk sent to OpenAI client, size: {len(processed_audio)} bytes")
