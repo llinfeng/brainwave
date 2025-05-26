@@ -107,6 +107,25 @@ Deploying **Brainwave** involves setting up a Python-based environment, installi
      $env:OPENAI_API_KEY="your-openai-api-key"
      ```
 
+   Optionally, you can configure where Brainwave saves audio recordings and transcripts by setting the `BRAINWAVE_RECORDINGS_DIR` environment variable:
+
+   - **On macOS/Linux:**
+     ```bash
+     export BRAINWAVE_RECORDINGS_DIR='/path/to/your/recordings'
+     ```
+
+   - **On Windows (Command Prompt):**
+     ```cmd
+     set BRAINWAVE_RECORDINGS_DIR=C:\Users\YourUsername\Dropbox\Stable\AudioWrite
+     ```
+
+   - **On Windows (PowerShell):**
+     ```powershell
+     $env:BRAINWAVE_RECORDINGS_DIR="C:\Users\YourUsername\Dropbox\Stable\AudioWrite"
+     ```
+
+   If not set, recordings will be saved to a `recordings` directory in the project folder.
+
 6. **Launch the Server**
 
    Start the FastAPI server using Uvicorn:

@@ -28,9 +28,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Ensure recordings directory exists
-RECORDINGS_DIR = "recordings"
-os.makedirs(RECORDINGS_DIR, exist_ok=True)
+# Get recordings directory from environment variable or use default
+RECORDINGS_DIR = os.getenv("BRAINWAVE_RECORDINGS_DIR", "recordings")
+
+# Validate and create recordings directory
+try:
+    os.makedirs(RECORDINGS_DIR, exist_ok=True)
+    # Test write permissions
+    test_file = os.path.join(RECORDINGS_DIR, "test_write_permission")
+    with open(test_file, 'w') as f:
+        f.write("test")
+    os.remove(test_file)
+    logger.info(f"Using recordings directory: {os.path.abspath(RECORDINGS_DIR)}")
+except Exception as e:
+    logger.error(f"Error setting up recordings directory {RECORDINGS_DIR}: {str(e)}")
+    raise EnvironmentError(f"Cannot access or write to recordings directory: {RECORDINGS_DIR}")
 
 # Pydantic models for request and response schemas
 class ReadabilityRequest(BaseModel):
