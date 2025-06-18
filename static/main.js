@@ -8,6 +8,33 @@ let wsConnected = false;
 let streamInitialized = false;
 let isAutoStarted = false;
 
+// Soundwave visualization
+let soundwaveCanvas, soundwaveCtx;
+let soundwaveData = [];
+let soundwaveAnimationId;
+let audioLevel = 0;
+let isSilent = true;
+
+// Buffer for waveform samples
+let waveformBuffer = [];
+const WAVEFORM_BUFFER_SIZE = 2048; // Number of samples to display (adjust for smoothness)
+
+// Polyfill for roundRect if not supported
+if (!CanvasRenderingContext2D.prototype.roundRect) {
+    CanvasRenderingContext2D.prototype.roundRect = function(x, y, width, height, radius) {
+        if (width < 2 * radius) radius = width / 2;
+        if (height < 2 * radius) radius = height / 2;
+        this.beginPath();
+        this.moveTo(x + radius, y);
+        this.arcTo(x + width, y, x + width, y + height, radius);
+        this.arcTo(x + width, y + height, x, y + height, radius);
+        this.arcTo(x, y + height, x, y, radius);
+        this.arcTo(x, y, x + width, y, radius);
+        this.closePath();
+        return this;
+    };
+}
+
 // DOM elements
 const recordButton = document.getElementById('recordButton');
 const transcript = document.getElementById('transcript');
@@ -25,6 +52,76 @@ const autoStart = urlParams.get('start') === '1';
 
 // Utility functions
 const isMobileDevice = () => /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+
+// Soundwave visualization functions
+function initSoundwave() {
+    soundwaveCanvas = document.getElementById('soundwaveCanvas');
+    soundwaveCtx = soundwaveCanvas.getContext('2d');
+    
+    // Set canvas size based on container
+    const container = soundwaveCanvas.parentElement;
+    const containerWidth = container.clientWidth - 20; // Account for padding
+    soundwaveCanvas.width = Math.min(600, containerWidth);
+    soundwaveCanvas.height = 80;
+    
+    // Initialize waveform buffer (centered/flat)
+    waveformBuffer = new Array(WAVEFORM_BUFFER_SIZE).fill(0);
+    
+    startSoundwaveAnimation();
+}
+
+function startSoundwaveAnimation() {
+    function animate() {
+        renderWaveform();
+        soundwaveAnimationId = requestAnimationFrame(animate);
+    }
+    animate();
+}
+
+function renderWaveform() {
+    const ctx = soundwaveCtx;
+    const width = soundwaveCanvas.width;
+    const height = soundwaveCanvas.height;
+    
+    // Clear canvas
+    ctx.clearRect(0, 0, width, height);
+    
+    // Determine colors based on theme
+    const isDark = document.body.classList.contains('dark-theme');
+    const lineColor = isDark ? '#34C759' : '#007AFF';
+    const silentColor = isDark ? '#48484A' : '#E5E5E7';
+    
+    // Draw waveform line
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = isSilent ? silentColor : lineColor;
+    ctx.beginPath();
+    for (let i = 0; i < waveformBuffer.length; i++) {
+        const x = (i / (waveformBuffer.length - 1)) * width;
+        // waveformBuffer values are in [-1, 1], map to canvas height
+        const y = height / 2 - waveformBuffer[i] * (height / 2) * 0.9;
+        if (i === 0) {
+            ctx.moveTo(x, y);
+        } else {
+            ctx.lineTo(x, y);
+        }
+    }
+    ctx.stroke();
+}
+
+function updateSoundwave(audioData) {
+    if (!audioData || audioData.length === 0) {
+        isSilent = true;
+        // Gradually flatten the waveform when silent
+        for (let i = 0; i < waveformBuffer.length; i++) {
+            waveformBuffer[i] *= 0.9;
+        }
+        return;
+    }
+    isSilent = false;
+    // Append new audio samples to the buffer, keeping the buffer size fixed
+    const newSamples = Array.from(audioData);
+    waveformBuffer = waveformBuffer.concat(newSamples).slice(-WAVEFORM_BUFFER_SIZE);
+}
 
 async function copyToClipboard(text, button) {
     if (!text) return;
@@ -73,6 +170,9 @@ function createAudioProcessor() {
         
         const inputData = e.inputBuffer.getChannelData(0);
         const pcmData = new Int16Array(inputData.length);
+        
+        // Update soundwave visualization with audio data
+        updateSoundwave(inputData);
         
         for (let i = 0; i < inputData.length; i++) {
             pcmData[i] = Math.max(-32768, Math.min(32767, Math.floor(inputData[i] * 32767)));
@@ -210,6 +310,12 @@ async function stopRecording() {
     isRecording = false;
     startTimer();
     
+    // Reset soundwave visualization
+    isSilent = true;
+    for (let i = 0; i < waveformBuffer.length; i++) {
+        waveformBuffer[i] = 0;
+    }
+    
     if (audioBuffer.length > 0 && ws.readyState === WebSocket.OPEN) {
         ws.send(audioBuffer.buffer);
         audioBuffer = new Int16Array(0);
@@ -242,8 +348,26 @@ document.addEventListener('keydown', (event) => {
 document.addEventListener('DOMContentLoaded', () => {
     initializeWebSocket();
     initializeTheme();
+    initSoundwave();
     if (autoStart) initializeAudioStream();
 });
+
+// Handle window resize for responsive soundwave
+window.addEventListener('resize', () => {
+    if (soundwaveCanvas) {
+        const container = soundwaveCanvas.parentElement;
+        const containerWidth = container.clientWidth - 20;
+        soundwaveCanvas.width = Math.min(600, containerWidth);
+        soundwaveCanvas.height = 80;
+        
+        // Recalculate number of bars
+        const numBars = Math.floor(soundwaveCanvas.width / 4);
+        if (soundwaveData.length !== numBars) {
+            soundwaveData = new Array(numBars).fill(0);
+        }
+    }
+});
+
 // Readability and AI handlers
 readabilityButton.onclick = async () => {
     startTimer();

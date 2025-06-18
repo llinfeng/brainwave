@@ -42,7 +42,8 @@ try:
     logger.info(f"Using recordings directory: {os.path.abspath(RECORDINGS_DIR)}")
 except Exception as e:
     logger.error(f"Error setting up recordings directory {RECORDINGS_DIR}: {str(e)}")
-    raise EnvironmentError(f"Cannot access or write to recordings directory: {RECORDINGS_DIR}")
+    # Only log the error, do not raise or stop the server
+    logger.error(f"Warning: Cannot access or write to recordings directory: {RECORDINGS_DIR}. Audio and transcript saving will be disabled.")
 
 # Pydantic models for request and response schemas
 class ReadabilityRequest(BaseModel):
