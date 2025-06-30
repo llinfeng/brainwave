@@ -19,6 +19,60 @@ let isSilent = true;
 let waveformBuffer = [];
 const WAVEFORM_BUFFER_SIZE = 2048; // Number of samples to display (adjust for smoothness)
 
+// Function to update heading based on recording state
+function updateHeading() {
+    const heading = document.getElementById('statusHeading');
+    console.log('updateHeading called, isRecording:', isRecording, 'streamInitialized:', streamInitialized, 'heading found:', !!heading);
+    
+    if (heading) {
+        let statusText;
+        if (isRecording) {
+            statusText = 'listening...';
+        } else {
+            statusText = 'ready';
+        }
+        
+        heading.textContent = statusText;
+        console.log('Heading updated to:', heading.textContent);
+    } else {
+        console.error('Heading element not found!');
+    }
+}
+
+// Function to show missing mic error
+function showMissingMic() {
+    const heading = document.getElementById('statusHeading');
+    if (heading) {
+        heading.textContent = 'Missing Mic';
+        console.log('Heading updated to: Missing Mic');
+    }
+}
+
+// Function to check microphone permission status
+async function checkMicrophonePermission() {
+    try {
+        const permissionStatus = await navigator.permissions.query({ name: 'microphone' });
+        
+        if (permissionStatus.state === 'denied') {
+            showMissingMic();
+        } else {
+            updateHeading();
+        }
+        
+        // Listen for permission changes
+        permissionStatus.onchange = () => {
+            if (permissionStatus.state === 'denied') {
+                showMissingMic();
+            } else {
+                updateHeading();
+            }
+        };
+    } catch (error) {
+        console.log('Permission API not supported, will check on first use');
+        updateHeading();
+    }
+}
+
 // Polyfill for roundRect if not supported
 if (!CanvasRenderingContext2D.prototype.roundRect) {
     CanvasRenderingContext2D.prototype.roundRect = function(x, y, width, height, radius) {
@@ -286,6 +340,7 @@ async function startRecording() {
                 } 
             });
             streamInitialized = true;
+            updateHeading();
         }
 
         if (!stream) throw new Error('Failed to initialize audio stream');
@@ -298,8 +353,10 @@ async function startRecording() {
         recordButton.textContent = 'Stop';
         recordButton.classList.add('recording');
         
+        updateHeading();
     } catch (error) {
         console.error('Error starting recording:', error);
+        showMissingMic();
         alert('Error accessing microphone: ' + error.message);
     }
 }
@@ -326,6 +383,8 @@ async function stopRecording() {
     
     recordButton.textContent = 'Start';
     recordButton.classList.remove('recording');
+    
+    updateHeading();
 }
 
 // Event listeners
@@ -349,6 +408,7 @@ document.addEventListener('DOMContentLoaded', () => {
     initializeWebSocket();
     initializeTheme();
     initSoundwave();
+    checkMicrophonePermission(); // Check mic permission status
     if (autoStart) initializeAudioStream();
 });
 
