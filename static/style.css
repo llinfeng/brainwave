@@ -24,6 +24,12 @@ h1 {
     text-align: center;
 }
 
+#statusHeading {
+    font-family: 'Courier New', 'Consolas', 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+    font-size: 1.8rem;
+    letter-spacing: 0.5px;
+}
+
 #recordButton {
     width: 100px;
     height: 100px;
