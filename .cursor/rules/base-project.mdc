@@ -1,0 +1,115 @@
+---
+description: 
+globs: 
+alwaysApply: false
+---
+
+# Brainwave Codebase Structure
+
+## Core Components
+
+### 1. Server (`realtime_server.py`)
+- Main FastAPI server handling WebSocket connections and HTTP endpoints
+- Manages real-time audio streaming and processing
+- Key classes:
+  - `AudioProcessor`: Handles audio resampling (48kHz → 24kHz)
+  - WebSocket endpoint `/api/v1/ws`: Manages real-time audio streaming
+- REST endpoints:
+  - `/api/v1/readability`: Enhances text readability
+  - `/api/v1/ask_ai`: General AI question answering
+  - `/api/v1/correctness`: Checks factual correctness
+
+### 2. OpenAI Client (`openai_realtime_client.py`)
+- Manages WebSocket connection to OpenAI's real-time API
+- Handles audio streaming and transcription
+- Event-based architecture for handling responses
+
+### 3. LLM Processor (`llm_processor.py`)
+- Abstract interface for different LLM backends
+- Implementations:
+  - `GeminiProcessor`: Google's Gemini model integration
+  - `GPTProcessor`: OpenAI's GPT models integration
+- Factory pattern via `get_llm_processor(model)`
+
+### 4. Prompts (`prompts.py`)
+- Contains predefined prompts in Chinese and English
+- Used for text enhancement and processing tasks
+
+## Directory Structure
+```
+brainwave/
+├── .cursor/          # IDE configuration
+├── static/           # Frontend static files
+├── tests/            # Test suite
+├── venv/            # Python virtual environment
+├── __init__.py      # Package initialization
+├── openai_realtime_client.py
+├── realtime_server.py
+├── llm_processor.py
+├── prompts.py
+├── requirements.txt
+└── README.md
+```
+
+## Key Dependencies
+- FastAPI: Web framework
+- OpenAI: GPT model integration
+- Google Generative AI: Gemini model integration
+- NumPy & SciPy: Audio processing
+- Uvicorn: ASGI server
+
+## Environment Variables
+Required:
+- `OPENAI_API_KEY`: For OpenAI services
+- `GOOGLE_API_KEY`: For Gemini services (optional)
+
+## Main Workflows
+
+### 1. Real-time Speech Recognition
+1. Client connects via WebSocket
+2. Audio streaming begins
+3. Server resamples audio (48kHz → 24kHz)
+4. OpenAI client processes audio stream
+5. Real-time transcription sent back to client
+
+### 2. Text Processing
+1. Text submitted via REST endpoints
+2. LLM processor selects appropriate model
+3. Text processed according to task:
+   - Readability enhancement
+   - Factual checking
+   - General Q&A
+
+## Development Guidelines
+
+### Adding New Features
+1. For new LLM models:
+   - Extend `LLMProcessor` class
+   - Implement required methods
+   - Add to `get_llm_processor` factory
+
+2. For new endpoints:
+   - Add route in `realtime_server.py`
+   - Define request/response models
+   - Implement processing logic
+
+3. For new prompts:
+   - Add to `prompts.py`
+   - Follow existing format for multilingual support
+
+### Testing
+- Run tests: `pytest tests/`
+- Mock API calls in tests
+- Set test environment variables
+
+### Security Notes
+- API keys must be properly secured
+- WebSocket connections authenticated
+- Rate limiting implemented
+
+## Performance Considerations
+- Audio processing optimized for real-time
+- Async operations for non-blocking I/O
+- Streaming responses for better UX
+
+- Buffer management for audio chunks 
