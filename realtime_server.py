@@ -20,6 +20,7 @@ from llm_processor import get_llm_processor
 from datetime import datetime, timedelta
 import soundfile as sf
 import io
+import re
 
 # Configure logging
 logging.basicConfig(
@@ -87,28 +88,29 @@ class AudioProcessor:
         self.current_session_id = None
         self.current_transcription = []
         self.audio_buffer = []  # Add audio buffer as instance variable
-        
+        self.current_filename = None  # Cache for generated filename
+
     def process_audio_chunk(self, audio_data):
         # Convert binary audio data to Int16 array
         pcm_data = np.frombuffer(audio_data, dtype=np.int16)
-        
+
         # Convert to float32 for better precision during resampling
         float_data = pcm_data.astype(np.float32) / 32768.0
-        
+
         # Resample from 48kHz to 24kHz
         resampled_data = scipy.signal.resample_poly(
-            float_data, 
-            self.target_sample_rate, 
+            float_data,
+            self.target_sample_rate,
             self.source_sample_rate
         )
-        
+
         # Convert back to int16 while preserving amplitude
         resampled_int16 = (resampled_data * 32768.0).clip(-32768, 32767).astype(np.int16)
         processed_audio = resampled_int16.tobytes()
-        
+
         # Store the processed audio in our buffer
         self.audio_buffer.append(processed_audio)
-        
+
         return processed_audio
 
     def start_new_session(self):
@@ -116,50 +118,138 @@ class AudioProcessor:
         self.current_session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.current_transcription = []
         self.audio_buffer = []  # Clear audio buffer for new session
+        self.current_filename = None  # Reset cached filename for new session
         return self.current_session_id
 
     def add_transcription_text(self, text):
         """Add transcription text to the current session"""
         if self.current_session_id:
             self.current_transcription.append(text)
+            logger.debug(f"Added text to transcription: '{text}', total pieces: {len(self.current_transcription)}")
+        else:
+            logger.warning(f"No session ID when trying to add text: '{text}'")
+
+    def generate_content_filename(self, text_content):
+        """Generate a descriptive filename from transcribed text content, caching the result for reuse."""
+        if self.current_filename:
+            return self.current_filename
+        logger.info(f"Generating content filename for text: {text_content[:100]}...")
+
+        if not text_content or len(text_content.strip()) < 10:
+            # Fallback for very short content
+            fallback_name = f"{self.current_session_id}_recording-too-short"
+            logger.info(f"Text too short, using fallback name: {fallback_name}")
+            self.current_filename = fallback_name
+            return fallback_name
+
+        try:
+            # Use LLM to generate a short, descriptive title
+            llm_processor = get_llm_processor("gpt-4o")
+            prompt = (
+                "Generate a short, descriptive filename (max 5-8 words) for this transcribed content. "
+                "Start with the main topic or keywords (nouns), followed by verbs or clarifying words if needed. "
+                "Do NOT include numbers, bullet points, or formatting at the beginning. "
+                "Use only alphanumeric characters and underscores. "
+                "Return only the filename, no quotes or extra text."
+            )
+
+            # Get the first 500 characters to avoid too long prompts
+            content_sample = text_content[:500]
+            if len(text_content) > 500:
+                content_sample += "..."
+
+            full_prompt = f"{prompt}\n\nContent: {content_sample}"
+            logger.info(f"Generating filename with prompt: {full_prompt[:200]}...")
+
+            # Generate filename synchronously
+            filename = llm_processor.process_text_sync(full_prompt, "", model="gpt-4o")
+            logger.info(f"Raw LLM response for filename: '{filename}'")
+
+            # Clean up the filename
+            filename = filename.strip().strip('"').strip("'")
+            # Remove any leading numbers, dots, or bullet points
+            filename = re.sub(r'^[\d\.\-\s]+', '', filename)
+            # Replace spaces and special characters with underscores
+            filename = re.sub(r'[^\w\s-]', '', filename)
+            filename = re.sub(r'[\s-]+', '_', filename)
+            filename = filename.lower()
+
+            # Limit length and ensure it's not empty
+            if len(filename) > 50:
+                filename = filename[:50]
+            if not filename:
+                filename = "transcription"
+
+            final_name = f"{self.current_session_id}_{filename}"
+            logger.info(f"Final generated filename: {final_name}")
+            self.current_filename = final_name
+            return final_name
+
+        except Exception as e:
+            logger.error(f"Error generating content filename: {str(e)}", exc_info=True)
+            # Fallback to timestamp with generic label
+            fallback_name = f"{self.current_session_id}_transcription"
+            logger.info(f"Using fallback filename: {fallback_name}")
+            self.current_filename = fallback_name
+            return fallback_name
 
     def save_audio_buffer(self, session_id=None):
-        """Save the audio buffer as a WAV file"""
+        """Save the audio buffer as a WAV file with content-based naming"""
         if not session_id:
             session_id = self.current_session_id
-        
+
         if not session_id:
             logger.warning("No session ID provided for audio save")
             return
-        
+
         if not self.audio_buffer:
             logger.warning("No audio data to save")
             return
-            
-        wav_path = os.path.join(RECORDINGS_DIR, f"{session_id}.wav")
+
+        # Generate content-based filename
+        full_text = ''.join(self.current_transcription)
+        logger.info(f"Full transcription text for audio save: {full_text[:200]}...")
+        logger.info(f"Transcription length: {len(full_text)} characters")
+
+        filename = self.generate_content_filename(full_text)
+        wav_path = os.path.join(RECORDINGS_DIR, f"{filename}.wav")
+
+        logger.info(f"Saving audio with filename: {filename}")
+        logger.info(f"Full audio path: {wav_path}")
+
         with wave.open(wav_path, 'wb') as wf:
             wf.setnchannels(1)  # Mono audio
             wf.setsampwidth(2)  # 2 bytes per sample (16-bit)
             wf.setframerate(self.target_sample_rate)
             wf.writeframes(b''.join(self.audio_buffer))
-        
+
         logger.info(f"Saved audio recording to {wav_path}")
 
     def save_transcription(self, session_id=None):
-        """Save the transcription as a text file with UTF-8-BOM encoding for Windows compatibility"""
+        """Save the transcription as a text file with content-based naming and UTF-8-BOM encoding"""
         if not session_id:
             session_id = self.current_session_id
-        
+
         if not session_id or not self.current_transcription:
             logger.warning("No session ID or transcription available")
             return
-        
-        txt_path = os.path.join(RECORDINGS_DIR, f"{session_id}.txt")
+
+        # Generate content-based filename
+        full_text = ''.join(self.current_transcription)
+        logger.info(f"Full transcription text for text save: {full_text[:200]}...")
+        logger.info(f"Transcription length: {len(full_text)} characters")
+
+        filename = self.generate_content_filename(full_text)
+        txt_path = os.path.join(RECORDINGS_DIR, f"{filename}.txt")
+
+        logger.info(f"Saving transcription with filename: {filename}")
+        logger.info(f"Full text path: {txt_path}")
+
         with open(txt_path, 'wb') as f:  # Open in binary mode
             # Write UTF-8 BOM
             f.write(b'\xef\xbb\xbf')
             # Write content encoded as UTF-8
-            f.write(''.join(self.current_transcription).encode('utf-8'))
+            f.write(full_text.encode('utf-8'))
         logger.info(f"Saved transcription to {txt_path} with UTF-8-BOM encoding")
 
 @app.websocket("/api/v1/ws")
@@ -167,37 +257,39 @@ async def websocket_endpoint(websocket: WebSocket):
     logger.info("New WebSocket connection attempt")
     await websocket.accept()
     logger.info("WebSocket connection accepted")
-    
+
     # Add initial status update here
     await websocket.send_text(json.dumps({
         "type": "status",
         "status": "idle"  # Set initial status to idle (blue)
     }))
-    
+
     client = None
     audio_processor = AudioProcessor()
     recording_stopped = asyncio.Event()
     openai_ready = asyncio.Event()
     pending_audio_chunks = []
+
     # Add synchronization for audio sending operations
     pending_audio_operations = 0
     audio_send_lock = asyncio.Lock()
     all_audio_sent = asyncio.Event()
     all_audio_sent.set()  # Initially set since no audio is pending
-    
+
+
     async def initialize_openai():
         nonlocal client
         try:
             # Clear the ready flag while initializing
             openai_ready.clear()
-            
+
             client = OpenAIRealtimeAudioTextClient(os.getenv("OPENAI_API_KEY"))
             await client.connect()
             logger.info("Successfully connected to OpenAI client")
-            
+
             # Start a new recording session
             audio_processor.start_new_session()
-            
+
             # Register handlers after client is initialized
             client.register_handler("session.updated", lambda data: handle_generic_event("session.updated", data))
             client.register_handler("input_audio_buffer.cleared", lambda data: handle_generic_event("input_audio_buffer.cleared", data))
@@ -213,7 +305,7 @@ async def websocket_endpoint(websocket: WebSocket):
             client.register_handler("error", lambda data: handle_error(data))
             client.register_handler("response.text.delta", lambda data: handle_text_delta(data))
             client.register_handler("response.created", lambda data: handle_response_created(data))
-            
+
             openai_ready.set()  # Set ready flag after successful initialization
             await websocket.send_text(json.dumps({
                 "type": "status",
@@ -234,7 +326,9 @@ async def websocket_endpoint(websocket: WebSocket):
         try:
             if websocket.client_state == WebSocketState.CONNECTED:
                 text_delta = data.get("delta", "")
+                logger.info(f"Received text delta: '{text_delta}'")
                 audio_processor.add_transcription_text(text_delta)
+                logger.info(f"Current transcription length: {len(''.join(audio_processor.current_transcription))}")
                 await websocket.send_text(json.dumps({
                     "type": "text",
                     "content": text_delta,
@@ -265,13 +359,13 @@ async def websocket_endpoint(websocket: WebSocket):
         nonlocal client
         logger.info("Handled response.done")
         recording_stopped.set()
-        
+
         if client:
             try:
                 # Save the audio and transcription files
                 audio_processor.save_audio_buffer()
                 audio_processor.save_transcription()
-                
+
                 await client.close()
                 client = None
                 openai_ready.clear()
@@ -291,18 +385,18 @@ async def websocket_endpoint(websocket: WebSocket):
 
     async def receive_messages():
         nonlocal client
-        
+
         try:
             while True:
                 if websocket.client_state == WebSocketState.DISCONNECTED:
                     logger.info("WebSocket client disconnected")
                     openai_ready.clear()
                     break
-                    
+
                 try:
                     # Add timeout to prevent infinite waiting
                     data = await asyncio.wait_for(websocket.receive(), timeout=30.0)
-                    
+
                     if "bytes" in data:
                         processed_audio = audio_processor.process_audio_chunk(data["bytes"])
                         if not openai_ready.is_set():
@@ -314,7 +408,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                 nonlocal pending_audio_operations
                                 pending_audio_operations += 1
                                 all_audio_sent.clear()  # Clear the event since we have pending operations
-                            
+
                             try:
                                 await client.send_audio(processed_audio)
                                 await websocket.send_text(json.dumps({
@@ -330,10 +424,10 @@ async def websocket_endpoint(websocket: WebSocket):
                                         all_audio_sent.set()  # Set event when all operations complete
                         else:
                             logger.warning("Received audio but client is not initialized")
-                            
+
                     elif "text" in data:
                         msg = json.loads(data["text"])
-                        
+
                         if msg.get("type") == "start_recording":
                             # Update status to connecting while initializing OpenAI
                             await websocket.send_text(json.dumps({
@@ -344,7 +438,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                 continue
                             recording_stopped.clear()
                             pending_audio_chunks.clear()
-                            
+
                             # Send any buffered chunks
                             if pending_audio_chunks and client:
                                 logger.info(f"Sending {len(pending_audio_chunks)} buffered chunks")
@@ -353,7 +447,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                     async with audio_send_lock:
                                         pending_audio_operations += 1
                                         all_audio_sent.clear()
-                                    
+
                                     try:
                                         await client.send_audio(chunk)
                                     finally:
@@ -362,13 +456,13 @@ async def websocket_endpoint(websocket: WebSocket):
                                             if pending_audio_operations == 0:
                                                 all_audio_sent.set()
                                 pending_audio_chunks.clear()
-                            
+
                         elif msg.get("type") == "stop_recording":
                             if client:
                                 # CRITICAL FIX: Wait for all pending audio operations to complete
                                 # before committing to prevent data loss
                                 logger.info("Stop recording received, waiting for all audio to be sent...")
-                                
+
                                 # Wait for any pending audio chunks to be sent (with timeout for safety)
                                 try:
                                     await asyncio.wait_for(all_audio_sent.wait(), timeout=5.0)
@@ -379,10 +473,10 @@ async def websocket_endpoint(websocket: WebSocket):
                                     async with audio_send_lock:
                                         pending_audio_operations = 0
                                         all_audio_sent.set()
-                                
+
                                 # Add a small buffer to ensure network operations complete
                                 await asyncio.sleep(0.1)
-                                
+
                                 logger.info("All audio sent, committing audio buffer...")
                                 await client.commit_audio()
                                 await client.start_response(PROMPTS['paraphrase-gpt-realtime'])
@@ -400,7 +494,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 except Exception as e:
                     logger.error(f"Error in receive_messages loop: {str(e)}", exc_info=True)
                     break
-                
+
         finally:
             # Cleanup when the loop exits
             if client:
@@ -416,18 +510,18 @@ async def websocket_endpoint(websocket: WebSocket):
                 processed_audio = await audio_queue.get()
                 if processed_audio is None:
                     break
-                
+
                 # Add validation
                 if len(processed_audio) == 0:
                     logger.warning("Empty audio chunk received, skipping")
                     continue
-                
+
                 # Append the processed audio to the buffer
                 audio_processor.audio_buffer.append(processed_audio)
 
                 await client.send_audio(processed_audio)
                 logger.info(f"Audio chunk sent to OpenAI client, size: {len(processed_audio)} bytes")
-                
+
             except Exception as e:
                 logger.error(f"Error in send_audio_messages: {str(e)}", exc_info=True)
                 break
@@ -514,3 +608,4 @@ async def check_correctness(request: CorrectnessRequest):
 
 if __name__ == '__main__':
     uvicorn.run(app, host="0.0.0.0", port=3005)
+
