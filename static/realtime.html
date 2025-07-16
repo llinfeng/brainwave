@@ -18,9 +18,11 @@
         </div>
         
         <div class="record-button-container">
+            <button id="whisperUploadButton" class="upload-button">Upload (Whisper)</button>
             <button id="recordButton">Start</button>
-            <button id="uploadButton" class="upload-button">Upload (replication with *.wav)</button>
+            <button id="uploadButton" class="upload-button">Upload (Realtime)</button>
             <input type="file" id="fileInput" accept=".wav" style="display: none;">
+            <input type="file" id="whisperFileInput" accept=".wav" style="display: none;">
         </div>
         <div class="transcript-container">
             <textarea id="transcript"></textarea>

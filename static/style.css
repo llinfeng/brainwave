@@ -71,6 +71,19 @@ h1 {
     background-color: #636366;
 }
 
+.gray-button {
+    background-color: #D1D1D6 !important;
+    color: #8E8E93 !important;
+    opacity: 0.7;
+    cursor: not-allowed;
+}
+
+.gray-button:hover {
+    background-color: #D1D1D6 !important;
+    transform: none !important;
+    opacity: 0.7;
+}
+
 #recordButton:hover {
     transform: scale(1.05);
 }
@@ -328,4 +341,13 @@ body.dark-theme .action-button {
 
 body.dark-theme .action-button:hover {
     background-color: #248a3d;
+}
+
+body.dark-theme .gray-button {
+    background-color: #48484A !important;
+    color: #8E8E93 !important;
+}
+
+body.dark-theme .gray-button:hover {
+    background-color: #48484A !important;
 }

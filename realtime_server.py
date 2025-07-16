@@ -722,6 +722,56 @@ async def upload_wav(file: UploadFile = File(...)):
         logger.error(f"Error processing WAV file: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error processing WAV file: {str(e)}")
 
+@app.post(
+    "/api/v1/upload_wav_whisper",
+    summary="Upload WAV file for Whisper transcription",
+    description="Upload a WAV file to be transcribed using OpenAI Whisper API for literal transcription."
+)
+async def upload_wav_whisper(file: UploadFile = File(...)):
+    if not file.filename.lower().endswith('.wav'):
+        raise HTTPException(status_code=400, detail="Only WAV files are supported.")
+    
+    try:
+        logger.info(f"Processing uploaded WAV file with Whisper: {file.filename}")
+        
+        # Read the uploaded file
+        file_content = await file.read()
+        
+        # Initialize OpenAI client for Whisper
+        client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+        
+        # Create a temporary file for the audio
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as tmp_file:
+            tmp_file.write(file_content)
+            tmp_file_path = tmp_file.name
+        
+        try:
+            # Use OpenAI Whisper to transcribe the audio
+            with open(tmp_file_path, 'rb') as audio_file:
+                transcript = await client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=audio_file,
+                    response_format="text"
+                )
+            
+            logger.info(f"Successfully transcribed WAV file with Whisper: {file.filename}")
+            logger.info(f"Transcription length: {len(transcript)} characters")
+            
+            # Return the transcription as a streaming response
+            async def text_generator():
+                yield transcript
+            
+            return StreamingResponse(text_generator(), media_type="text/plain")
+            
+        finally:
+            # Clean up the temporary file
+            if os.path.exists(tmp_file_path):
+                os.unlink(tmp_file_path)
+    
+    except Exception as e:
+        logger.error(f"Error processing WAV file with Whisper: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error processing WAV file with Whisper: {str(e)}")
+
 if __name__ == '__main__':
     uvicorn.run(app, host="0.0.0.0", port=3005)
 
