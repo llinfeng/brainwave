@@ -18,9 +18,9 @@
         </div>
         
         <div class="record-button-container">
-            <button id="whisperUploadButton" class="upload-button">Upload (Whisper)</button>
+<div class="tooltip-container"><button id="whisperUploadButton" class="upload-button">Upload (Whisper)</button><span class="tooltip-text">Transcribes a WAV file using the Whisper API for a literal transcription.</span></div>
             <button id="recordButton">Start</button>
-            <button id="uploadButton" class="upload-button">Upload (Realtime)</button>
+<div class="tooltip-container"><button id="uploadButton" class="upload-button" title="Replicates the live recording process by sending a WAV file to the Realtime API.">Upload (Realtime)</button><span class="tooltip-text">Replicates the live recording process by sending a WAV file to the Realtime API.</span></div>
             <input type="file" id="fileInput" accept=".wav" style="display: none;">
             <input type="file" id="whisperFileInput" accept=".wav" style="display: none;">
         </div>
