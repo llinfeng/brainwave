@@ -2,7 +2,7 @@ import asyncio
 import json
 import os
 import numpy as np
-from fastapi import FastAPI, WebSocket, Request, HTTPException
+from fastapi import FastAPI, WebSocket, Request, HTTPException, UploadFile, File
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse
 import uvicorn
@@ -21,6 +21,7 @@ from datetime import datetime, timedelta
 import soundfile as sf
 import io
 import re
+import tempfile
 
 # Configure logging
 logging.basicConfig(
@@ -479,7 +480,11 @@ async def websocket_endpoint(websocket: WebSocket):
 
                                 logger.info("All audio sent, committing audio buffer...")
                                 await client.commit_audio()
-                                await client.start_response(PROMPTS['paraphrase-gpt-realtime'])
+                                
+                                # Debug: log the prompt being sent
+                                prompt_text = PROMPTS['paraphrase-gpt-realtime']
+                                logger.info(f"Sending prompt to realtime API: {prompt_text[:200]}...")
+                                await client.start_response(prompt_text)
                                 await recording_stopped.wait()
                                 # Don't close the client here, let the disconnect timer handle it
                                 # Update client status to connected (waiting for response)
@@ -605,6 +610,117 @@ async def check_correctness(request: CorrectnessRequest):
     except Exception as e:
         logger.error(f"Error checking correctness: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error processing correctness check.")
+
+@app.post(
+    "/api/v1/upload_wav",
+    summary="Upload WAV file for transcription",
+    description="Upload a WAV file to be processed using OpenAI Realtime API with the same prompt as live recording."
+)
+async def upload_wav(file: UploadFile = File(...)):
+    if not file.filename.lower().endswith('.wav'):
+        raise HTTPException(status_code=400, detail="Only WAV files are supported.")
+    
+    try:
+        logger.info(f"Processing uploaded WAV file: {file.filename}")
+        
+        # Read the uploaded file
+        file_content = await file.read()
+        
+        # Create a temporary file to store the uploaded WAV
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as tmp_file:
+            tmp_file.write(file_content)
+            tmp_file_path = tmp_file.name
+        
+        try:
+            # Load and process the WAV file to get the right format
+            with wave.open(tmp_file_path, 'rb') as wav_file:
+                # Get audio parameters
+                frames = wav_file.readframes(wav_file.getnframes())
+                sample_rate = wav_file.getframerate()
+                channels = wav_file.getnchannels()
+                sample_width = wav_file.getsampwidth()
+                
+                logger.info(f"WAV file info: {sample_rate}Hz, {channels} channels, {sample_width} bytes/sample")
+                
+                # Convert to the format expected by the realtime API (PCM16, mono, 24kHz)
+                audio_data = np.frombuffer(frames, dtype=np.int16)
+                
+                # Convert to mono if stereo
+                if channels == 2:
+                    audio_data = audio_data.reshape(-1, 2).mean(axis=1).astype(np.int16)
+                    
+                # Resample to 24kHz if needed
+                if sample_rate != 24000:
+                    # Convert to float for resampling
+                    float_data = audio_data.astype(np.float32) / 32768.0
+                    resampled_data = scipy.signal.resample_poly(
+                        float_data, 24000, sample_rate
+                    )
+                    audio_data = (resampled_data * 32768.0).clip(-32768, 32767).astype(np.int16)
+                
+                # Convert back to bytes
+                processed_audio = audio_data.tobytes()
+                
+            # Initialize OpenAI Realtime client
+            client = OpenAIRealtimeAudioTextClient(OPENAI_API_KEY)
+            await client.connect()
+            
+            # Collect response text
+            response_text = []
+            response_complete = asyncio.Event()
+            
+            async def handle_text_delta(data):
+                text_delta = data.get("delta", "")
+                if text_delta:
+                    response_text.append(text_delta)
+            
+            async def handle_response_done(data):
+                response_complete.set()
+            
+            # Register handlers
+            client.register_handler("response.text.delta", handle_text_delta)
+            client.register_handler("response.done", handle_response_done)
+            
+            # Send the audio data in chunks (like realtime recording)
+            chunk_size = 4096  # Same as realtime recording
+            for i in range(0, len(processed_audio), chunk_size):
+                chunk = processed_audio[i:i + chunk_size]
+                await client.send_audio(chunk)
+                # Small delay to simulate realtime
+                await asyncio.sleep(0.01)
+            
+            # Commit the audio and start response with the same prompt
+            await client.commit_audio()
+            
+            # Debug: log the prompt being sent
+            prompt_text = PROMPTS['paraphrase-gpt-realtime']
+            logger.info(f"WAV Upload - Sending prompt to realtime API: {prompt_text[:200]}...")
+            await client.start_response(prompt_text)
+            
+            # Wait for response completion
+            await response_complete.wait()
+            
+            # Clean up
+            await client.close()
+            
+            # Return the collected response
+            full_response = ''.join(response_text)
+            logger.info(f"Successfully processed WAV file with Realtime API: {file.filename}")
+            logger.info(f"Response length: {len(full_response)} characters")
+            
+            async def text_generator():
+                yield full_response
+            
+            return StreamingResponse(text_generator(), media_type="text/plain")
+            
+        finally:
+            # Clean up the temporary file
+            if os.path.exists(tmp_file_path):
+                os.unlink(tmp_file_path)
+    
+    except Exception as e:
+        logger.error(f"Error processing WAV file: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error processing WAV file: {str(e)}")
 
 if __name__ == '__main__':
     uvicorn.run(app, host="0.0.0.0", port=3005)

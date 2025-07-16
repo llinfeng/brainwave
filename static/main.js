@@ -91,6 +91,8 @@ if (!CanvasRenderingContext2D.prototype.roundRect) {
 
 // DOM elements
 const recordButton = document.getElementById('recordButton');
+const uploadButton = document.getElementById('uploadButton');
+const fileInput = document.getElementById('fileInput');
 const transcript = document.getElementById('transcript');
 const enhancedTranscript = document.getElementById('enhancedTranscript');
 const copyButton = document.getElementById('copyButton');
@@ -386,6 +388,80 @@ async function stopRecording() {
     
     updateHeading();
 }
+
+// WAV file upload functionality
+uploadButton.onclick = () => {
+    fileInput.click();
+};
+
+fileInput.onchange = async (event) => {
+    const file = event.target.files[0];
+    if (!file) return;
+    
+    if (!file.name.toLowerCase().endsWith('.wav')) {
+        alert('Please select a WAV file.');
+        return;
+    }
+    
+    // Don't start timer during file processing - only start it when we get the first response
+    let timerStarted = false;
+    
+    try {
+        // Clear previous transcription
+        transcript.value = '';
+        enhancedTranscript.value = '';
+        
+        // Update button text to show processing
+        uploadButton.textContent = 'Processing...';
+        uploadButton.disabled = true;
+        
+        const formData = new FormData();
+        formData.append('file', file);
+        
+        const response = await fetch('/api/v1/upload_wav', {
+            method: 'POST',
+            body: formData
+        });
+        
+        if (!response.ok) {
+            throw new Error(`Upload failed: ${response.statusText}`);
+        }
+        
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let fullText = '';
+        
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            
+            // Start timer only when we get the first chunk of transcription
+            if (!timerStarted && value && value.length > 0) {
+                startTimer();
+                timerStarted = true;
+            }
+            
+            fullText += decoder.decode(value, { stream: true });
+            transcript.value = fullText;
+            transcript.scrollTop = transcript.scrollHeight;
+        }
+        
+        if (!isMobileDevice()) copyToClipboard(fullText, copyButton);
+        if (timerStarted) stopTimer();
+        
+    } catch (error) {
+        console.error('Error uploading WAV file:', error);
+        alert('Error processing WAV file: ' + error.message);
+        // Only stop timer if it was started
+        if (timerStarted) stopTimer();
+    } finally {
+        // Reset button to original text
+        uploadButton.textContent = 'Upload WAV';
+        uploadButton.disabled = false;
+        // Clear file input
+        fileInput.value = '';
+    }
+};
 
 // Event listeners
 recordButton.onclick = () => isRecording ? stopRecording() : startRecording();

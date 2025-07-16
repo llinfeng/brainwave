@@ -17,7 +17,11 @@
             <canvas id="soundwaveCanvas" width="600" height="80"></canvas>
         </div>
         
-        <button id="recordButton">Start</button>
+        <div class="record-button-container">
+            <button id="recordButton">Start</button>
+            <button id="uploadButton" class="upload-button">Upload (replication with *.wav)</button>
+            <input type="file" id="fileInput" accept=".wav" style="display: none;">
+        </div>
         <div class="transcript-container">
             <textarea id="transcript"></textarea>
             <button id="copyButton" class="copy-button">Copy</button>
