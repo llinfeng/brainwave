@@ -407,7 +407,8 @@ async def websocket_endpoint(websocket: WebSocket):
                         if not openai_ready.is_set():
                             logger.debug("OpenAI not ready, buffering audio chunk")
                             pending_audio_chunks.append(processed_audio)
-                        elif client:
+                        elif client and not recording_stopped.is_set():
+                            # Safety check: Only send audio if recording is still active
                             # Track pending audio operations
                             async with audio_send_lock:
                                 nonlocal pending_audio_operations
@@ -448,6 +449,10 @@ async def websocket_endpoint(websocket: WebSocket):
                             if pending_audio_chunks and client:
                                 logger.info(f"Sending {len(pending_audio_chunks)} buffered chunks")
                                 for chunk in pending_audio_chunks:
+                                    # Safety check: Stop sending if recording has been stopped
+                                    if recording_stopped.is_set():
+                                        logger.info("Recording stopped while sending buffered chunks, stopping transmission")
+                                        break
                                     # Track each buffered chunk operation
                                     async with audio_send_lock:
                                         pending_audio_operations += 1
