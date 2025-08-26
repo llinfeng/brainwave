@@ -1,10 +1,14 @@
 import websockets
+import websockets_proxy
 import json
 import base64
 import logging
 import time
+import os
 from typing import Optional, Callable, Dict, List
 import asyncio
+from python_socks import ProxyType
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -24,13 +28,43 @@ class OpenAIRealtimeAudioTextClient:
         
     async def connect(self, modalities: List[str] = ["text"]):
         """Connect to OpenAI's realtime API and configure the session"""
-        self.ws = await websockets.connect(
-            f"{self.base_url}?model={self.model}",
-            extra_headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "OpenAI-Beta": "realtime=v1"
-            }
-        )
+        # Check for proxy configuration
+        proxy_url = os.environ.get('ALL_PROXY') or os.environ.get('all_proxy')
+        logger.info(f"Proxy detection - ALL_PROXY: {os.environ.get('ALL_PROXY')}, all_proxy: {os.environ.get('all_proxy')}, using: {proxy_url}")
+        
+        if proxy_url:
+            # Parse proxy URL to create proper proxy object
+            parsed = urlparse(proxy_url)
+            if parsed.scheme == 'socks5':
+                from python_socks.async_.asyncio import Proxy
+                from python_socks import ProxyType
+                proxy = Proxy.from_url(proxy_url)
+                proxy_connector = websockets_proxy.proxy_connect(
+                    f"{self.base_url}?model={self.model}",
+                    proxy=proxy,
+                    extra_headers={
+                        "Authorization": f"Bearer {self.api_key}",
+                        "OpenAI-Beta": "realtime=v1"
+                    }
+                )
+                self.ws = await proxy_connector
+            else:
+                logger.warning(f"Unsupported proxy scheme: {parsed.scheme}, falling back to direct connection")
+                self.ws = await websockets.connect(
+                    f"{self.base_url}?model={self.model}",
+                    extra_headers={
+                        "Authorization": f"Bearer {self.api_key}",
+                        "OpenAI-Beta": "realtime=v1"
+                    }
+                )
+        else:
+            self.ws = await websockets.connect(
+                f"{self.base_url}?model={self.model}",
+                extra_headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "OpenAI-Beta": "realtime=v1"
+                }
+            )
         
         # Wait for session creation
         response = await self.ws.recv()
@@ -45,7 +79,9 @@ class OpenAIRealtimeAudioTextClient:
                 "session": {
                     "modalities": modalities,
                     "input_audio_format": "pcm16",
-                    "input_audio_transcription": None,
+                    "input_audio_transcription": {
+                        "model": "whisper-1"
+                    },
                     "turn_detection": None,
                 }
             }))

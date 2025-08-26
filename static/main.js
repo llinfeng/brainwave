@@ -220,11 +220,52 @@ function stopTimer() {
     clearInterval(timerInterval);
 }
 
+// Audio cleanup function
+function cleanupAudioResources() {
+    console.log("Cleaning up audio resources");
+    
+    // Stop audio processing
+    isRecording = false;
+    
+    // Clean up audio components
+    if (processor) {
+        processor.onaudioprocess = null;
+        processor.disconnect();
+        processor = null;
+    }
+    if (source) {
+        source.disconnect();
+        source = null;
+    }
+    
+    // Stop media stream tracks
+    if (stream) {
+        stream.getTracks().forEach(track => track.stop());
+        stream = null;
+        streamInitialized = false;
+    }
+    
+    // Close audio context
+    if (audioContext) {
+        audioContext.close();
+        audioContext = null;
+    }
+    
+    // Update UI
+    recordButton.textContent = 'Start';
+    recordButton.classList.remove('recording');
+    
+    console.log("Audio resources cleaned up");
+}
+
 // Audio processing
 function createAudioProcessor() {
     processor = audioContext.createScriptProcessor(4096, 1, 1);
     processor.onaudioprocess = (e) => {
-        if (!isRecording) return;
+        if (!isRecording) {
+            console.log("Audio processing called but not recording - should be stopped");
+            return;
+        }
         
         const inputData = e.inputBuffer.getChannelData(0);
         const pcmData = new Int16Array(inputData.length);
@@ -258,7 +299,7 @@ async function initAudio(stream) {
     source = audioContext.createMediaStreamSource(stream);
     processor = createAudioProcessor();
     source.connect(processor);
-    processor.connect(audioContext.destination);
+    // Don't connect to destination - this causes audio feedback/sizzling sound
 }
 
 // WebSocket handling
@@ -316,6 +357,11 @@ function initializeWebSocket() {
                 alert(data.content);
                 updateConnectionStatus('idle');
                 break;
+            case 'cleanup_audio':
+                // Server tells us to clean up audio resources
+                console.log("Server requested audio cleanup");
+                cleanupAudioResources();
+                break;
         }
     };
     
@@ -331,6 +377,13 @@ async function startRecording() {
     if (isRecording) return;
     
     try {
+        // Ensure WebSocket is connected before starting
+        if (!wsConnected) {
+            connectWebSocket();
+            // Wait a bit for connection to establish
+            await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+        
         transcript.value = '';
         enhancedTranscript.value = '';
 
@@ -348,7 +401,7 @@ async function startRecording() {
         }
 
         if (!stream) throw new Error('Failed to initialize audio stream');
-        if (!audioContext) await initAudio(stream);
+        if (!audioContext || !processor || !source) await initAudio(stream);
 
         isRecording = true;
         await ws.send(JSON.stringify({ type: 'start_recording' }));
@@ -368,14 +421,16 @@ async function startRecording() {
 async function stopRecording() {
     if (!isRecording) return;
     
-    isRecording = false;
-    startTimer();
+    // IMMEDIATELY stop all audio processing - don't wait
+    cleanupAudioResources();
     
     // Reset soundwave visualization
     isSilent = true;
     for (let i = 0; i < waveformBuffer.length; i++) {
         waveformBuffer[i] = 0;
     }
+    
+    startTimer();
     
     if (audioBuffer.length > 0 && ws.readyState === WebSocket.OPEN) {
         ws.send(audioBuffer.buffer);
@@ -384,9 +439,6 @@ async function stopRecording() {
     
     await new Promise(resolve => setTimeout(resolve, 500));
     await ws.send(JSON.stringify({ type: 'stop_recording' }));
-    
-    recordButton.textContent = 'Start';
-    recordButton.classList.remove('recording');
     
     updateHeading();
 }

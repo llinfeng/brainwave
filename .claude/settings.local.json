@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python:*)",
+      "Bash(uv add:*)",
+      "Bash(uv pip install:*)",
+      "Bash(export:*)",
+      "Bash(uvicorn:*)",
+      "Bash(pip show:*)",
+      "Bash(source:*)",
+      "Bash(kill:*)",
+      "Bash(echo:*)",
+      "WebFetch(domain:platform.openai.com)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

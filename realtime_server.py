@@ -314,7 +314,7 @@ async def websocket_endpoint(websocket: WebSocket):
             }))
             return True
         except Exception as e:
-            logger.error(f"Failed to connect to OpenAI: {e}")
+            logger.error(f"Failed to connect to OpenAI: {e}", exc_info=True)
             openai_ready.clear()  # Ensure flag is cleared on failure
             await websocket.send_text(json.dumps({
                 "type": "error",
@@ -373,6 +373,10 @@ async def websocket_endpoint(websocket: WebSocket):
                 await websocket.send_text(json.dumps({
                     "type": "status",
                     "status": "idle"
+                }))
+                # Tell frontend to clean up audio resources
+                await websocket.send_text(json.dumps({
+                    "type": "cleanup_audio"
                 }))
                 logger.info("Connection closed after response completion")
             except Exception as e:
