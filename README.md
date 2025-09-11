@@ -132,7 +132,7 @@ Deploying **Brainwave** involves setting up a Python-based environment, installi
 
    The server will be accessible at:
    - **Local access:** `http://localhost:3005`
-   - **Network access:** `http://0.0.0.0:3005` (accessible from other devices on your network)
+   - **Network access:** `http://[your-machine-ip]:3005` (replace with your actual IP address for access from other devices)
 
    > **Note:** `uv run` automatically activates the virtual environment and runs the command with all dependencies available. No manual activation required!
 
