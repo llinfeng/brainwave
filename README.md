@@ -44,8 +44,8 @@ Deploying **Brainwave** involves setting up a Python-based environment, installi
 
 ### Prerequisites
 
-- **Python 3.8+**: Ensure that Python is installed on your system. You can download it from the [official website](https://www.python.org/downloads/).
-- **Virtual Environment Tool**: It's recommended to use `venv` or `virtualenv` to manage project dependencies.
+- **Python 3.11+**: Ensure that Python 3.11 or higher is installed on your system.
+- **uv**: A fast Python package manager and project manager. Install it from [uv documentation](https://docs.astral.sh/uv/getting-started/installation/).
 
 ### Setup Steps
 
@@ -56,36 +56,20 @@ Deploying **Brainwave** involves setting up a Python-based environment, installi
    cd brainwave
    ```
 
-2. **Create a Virtual Environment**
+2. **Install Dependencies and Create Virtual Environment**
+
+   Using uv, install all dependencies and create a virtual environment automatically:
 
    ```bash
-   python3 -m venv venv
+   uv sync
    ```
 
-3. **Activate the Virtual Environment**
+   This command will:
+   - Create a virtual environment in `.venv/`
+   - Install all dependencies from `pyproject.toml`
+   - Set up the project for development
 
-   - **On macOS/Linux:**
-
-     ```bash
-     source venv/bin/activate
-     ```
-
-   - **On Windows:**
-
-     ```bash
-     venv\Scripts\activate
-     ```
-
-4. **Install Dependencies**
-
-   Ensure that you have `pip` updated, then install the required packages:
-
-   ```bash
-   pip install --upgrade pip
-   pip install -r requirements.txt
-   ```
-
-5. **Configure Environment Variables**
+3. **Configure Environment Variables**
 
    Brainwave requires the OpenAI API key to function. Set the `OPENAI_API_KEY` environment variable:
 
@@ -126,19 +110,70 @@ Deploying **Brainwave** involves setting up a Python-based environment, installi
 
    If not set, recordings will be saved to a `recordings` directory in the project folder.
 
-6. **Launch the Server**
+4. **Launch the Server**
 
-   Start the FastAPI server using Uvicorn:
+   Start the FastAPI server using uv:
 
    ```bash
-   uvicorn realtime_server:app --host 0.0.0.0 --port 3005
+   uv run uvicorn realtime_server:app --host 0.0.0.0 --port 3005
    ```
 
-   The server will be accessible at `http://localhost:3005`.
+   **Alternative hosting options:**
+   ```bash
+   # For local development only (localhost access)
+   uv run uvicorn realtime_server:app --port 3005
 
-7. **Access the Application**
+   # For production with custom host and port
+   uv run uvicorn realtime_server:app --host 0.0.0.0 --port 8000
+
+   # With auto-reload for development
+   uv run uvicorn realtime_server:app --host 0.0.0.0 --port 3005 --reload
+   ```
+
+   The server will be accessible at:
+   - **Local access:** `http://localhost:3005`
+   - **Network access:** `http://0.0.0.0:3005` (accessible from other devices on your network)
+
+   > **Note:** `uv run` automatically activates the virtual environment and runs the command with all dependencies available. No manual activation required!
+
+5. **Access the Application**
 
    Open your web browser and navigate to `http://localhost:3005` to interact with Brainwave's speech recognition interface.
+
+### Hosting Troubleshooting
+
+If you encounter issues with hosting:
+
+- **Port already in use:** Change the port number (e.g., `--port 3006`)
+- **Permission denied on port 80/443:** Use a port number above 1024
+- **Can't access from other devices:** Ensure you're using `--host 0.0.0.0` and check your firewall settings
+- **Environment variables not found:** Make sure `OPENAI_API_KEY` is set in your shell session
+
+### Additional uv Commands
+
+Here are some useful uv commands for managing your development environment:
+
+```bash
+# Add a new dependency
+uv add package-name
+
+# Add a development dependency
+uv add --group dev package-name
+
+# Remove a dependency
+uv remove package-name
+
+# Update all dependencies
+uv lock --upgrade
+
+# Run any Python command in the managed environment
+uv run python script.py
+uv run python -m module_name
+
+# Activate the virtual environment manually (optional)
+source .venv/bin/activate  # On macOS/Linux
+.venv\Scripts\activate     # On Windows
+```
 
 ---
 
@@ -188,9 +223,13 @@ Understanding the architecture of **Brainwave** provides insights into its real-
 
 ### 3. **Configuration**
 
-#### a. `requirements.txt`
+#### a. `pyproject.toml`
 
-Lists all Python dependencies required to run Brainwave, ensuring that the environment is set up with compatible packages:
+Defines the project configuration, dependencies, and metadata following modern Python packaging standards:
+- **Project metadata**: Name, version, description, and Python version requirements
+- **Dependencies**: Runtime dependencies needed for the application
+- **Development dependencies**: Testing and development tools organized in dependency groups
+- **Build configuration**: Settings for package building using hatchling
 
 ### 4. **Prompts & Text Processing**
 
@@ -225,22 +264,19 @@ To run the tests:
 
 1. **Install Test Dependencies**
 
-   The test dependencies are included in `requirements.txt`. Make sure you have them installed:
-   ```bash
-   pip install pytest pytest-asyncio pytest-mock httpx
-   ```
+   Test dependencies are automatically installed when you run `uv sync` (they're included in the `dev` dependency group).
 
 2. **Run Tests**
 
    ```bash
    # Run all tests
-   pytest tests/
+   uv run pytest tests/
 
    # Run tests with verbose output
-   pytest -v tests/
+   uv run pytest -v tests/
 
    # Run tests for a specific component
-   pytest tests/test_audio_processor.py
+   uv run pytest tests/test_audio_processor.py
    ```
 
 3. **Test Environment**
