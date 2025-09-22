@@ -69,6 +69,37 @@ Deploying **Brainwave** involves setting up a Python-based environment, installi
    - Install all dependencies from `pyproject.toml`
    - Set up the project for development
 
+   **To reinitialize/refresh the virtual environment:**
+   ```bash
+   # Reinstall all packages (useful after environment issues or updates)
+   uv sync --reinstall
+   
+   # Or completely remove and recreate the virtual environment
+   rm -rf .venv
+   uv sync
+   ```
+
+   **Virtual Environment Usage Options:**
+   
+   With uv, you have two ways to work with the virtual environment:
+   
+   - **Option 1 (Recommended): Use `uv run`** - No activation needed
+     ```bash
+     uv run python script.py
+     uv run uvicorn realtime_server:app --port 3005
+     uv run pytest tests/
+     ```
+   
+   - **Option 2: Manual activation** - Traditional approach
+     ```bash
+     source .venv/bin/activate  # On Linux/macOS
+     .venv\Scripts\activate     # On Windows
+     # Now run commands normally:
+     python script.py
+     uvicorn realtime_server:app --port 3005
+     deactivate  # When finished
+     ```
+
 3. **Configure Environment Variables**
 
    Brainwave requires the OpenAI API key to function. Set the `OPENAI_API_KEY` environment variable:
@@ -151,8 +182,23 @@ If you encounter issues with hosting:
 
 ### Additional uv Commands
 
-Here are some useful uv commands for managing your development environment:
+Here are useful uv commands for managing your development environment:
 
+**Environment Management:**
+```bash
+# Check uv version
+uv --version
+
+# Show project information
+uv tree  # Show dependency tree
+uv pip list  # List installed packages
+
+# Clean and refresh environment
+uv sync --reinstall  # Reinstall all packages
+uv cache clean       # Clear uv cache
+```
+
+**Dependency Management:**
 ```bash
 # Add a new dependency
 uv add package-name
@@ -163,16 +209,35 @@ uv add --group dev package-name
 # Remove a dependency
 uv remove package-name
 
-# Update all dependencies
-uv lock --upgrade
+# Update dependencies
+uv lock --upgrade      # Update lock file with latest versions
+uv sync --upgrade      # Sync with updated lock file
+```
 
-# Run any Python command in the managed environment
+**Running Commands:**
+```bash
+# Run Python commands (recommended approach)
 uv run python script.py
 uv run python -m module_name
+uv run pytest tests/
+uv run uvicorn realtime_server:app --port 3005
 
-# Activate the virtual environment manually (optional)
-source .venv/bin/activate  # On macOS/Linux
+# Alternative: Manual activation (traditional approach)
+source .venv/bin/activate  # On Linux/macOS
 .venv\Scripts\activate     # On Windows
+# Then run commands normally without 'uv run'
+```
+
+**Project Setup Commands:**
+```bash
+# Initialize a new uv project
+uv init
+
+# Install dependencies from existing pyproject.toml
+uv sync
+
+# Install specific Python version for project
+uv python install 3.12
 ```
 
 ---
