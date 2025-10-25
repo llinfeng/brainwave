@@ -1,5 +1,5 @@
 // Global state
-let ws, audioContext, processor, source, stream;
+let ws, audioContext, processor, source, stream, gainNode;
 let isRecording = false;
 let timerInterval;
 let startTime;
@@ -223,83 +223,144 @@ function stopTimer() {
 // Audio cleanup function
 function cleanupAudioResources() {
     console.log("Cleaning up audio resources");
-    
+
     // Stop audio processing
     isRecording = false;
-    
+
     // Clean up audio components
     if (processor) {
         processor.onaudioprocess = null;
         processor.disconnect();
         processor = null;
     }
+    if (gainNode) {
+        gainNode.disconnect();
+        gainNode = null;
+    }
     if (source) {
         source.disconnect();
         source = null;
     }
-    
+
     // Stop media stream tracks
     if (stream) {
         stream.getTracks().forEach(track => track.stop());
         stream = null;
         streamInitialized = false;
     }
-    
+
     // Close audio context
     if (audioContext) {
         audioContext.close();
         audioContext = null;
     }
-    
+
     // Update UI
     recordButton.textContent = 'Start';
     recordButton.classList.remove('recording');
-    
+
     console.log("Audio resources cleaned up");
 }
 
 // Audio processing
+let audioProcessCallCount = 0;
 function createAudioProcessor() {
+    console.log('*** createAudioProcessor called');
     processor = audioContext.createScriptProcessor(4096, 1, 1);
+    console.log('*** ScriptProcessor created:', processor);
+
     processor.onaudioprocess = (e) => {
+        audioProcessCallCount++;
+
+        // Log first 5 calls to confirm it's working
+        if (audioProcessCallCount <= 5) {
+            console.log(`*** onaudioprocess called #${audioProcessCallCount}, isRecording:`, isRecording);
+        }
+
         if (!isRecording) {
             console.log("Audio processing called but not recording - should be stopped");
             return;
         }
-        
+
         const inputData = e.inputBuffer.getChannelData(0);
         const pcmData = new Int16Array(inputData.length);
-        
+
         // Update soundwave visualization with audio data
         updateSoundwave(inputData);
-        
+
         for (let i = 0; i < inputData.length; i++) {
             pcmData[i] = Math.max(-32768, Math.min(32767, Math.floor(inputData[i] * 32767)));
         }
-        
+
         const combinedBuffer = new Int16Array(audioBuffer.length + pcmData.length);
         combinedBuffer.set(audioBuffer);
         combinedBuffer.set(pcmData, audioBuffer.length);
         audioBuffer = combinedBuffer;
-        
+
+        // Log buffer size periodically for debugging
+        if (audioBuffer.length % 48000 === 0) {
+            console.log(`Audio buffer size: ${audioBuffer.length} samples (${(audioBuffer.length / 48000).toFixed(2)}s at 48kHz)`);
+        }
+
         if (audioBuffer.length >= 24000) {
             const sendBuffer = audioBuffer.slice(0, 24000);
             audioBuffer = audioBuffer.slice(24000);
-            
+
             if (ws.readyState === WebSocket.OPEN) {
                 ws.send(sendBuffer.buffer);
             }
         }
     };
+
+    console.log('*** onaudioprocess handler attached');
     return processor;
 }
 
 async function initAudio(stream) {
+    console.log('*** initAudio called with stream:', stream);
     audioContext = new AudioContext();
+    console.log('*** AudioContext created, state:', audioContext.state, 'sampleRate:', audioContext.sampleRate);
+
+    // Resume AudioContext if it's suspended (required in some browsers like Edge)
+    if (audioContext.state === 'suspended') {
+        await audioContext.resume();
+        console.log('AudioContext resumed from suspended state');
+    }
+
     source = audioContext.createMediaStreamSource(stream);
+    console.log('*** MediaStreamSource created:', source);
+
     processor = createAudioProcessor();
+    console.log('*** About to connect: source -> processor');
     source.connect(processor);
-    // Don't connect to destination - this causes audio feedback/sizzling sound
+    console.log('*** Connected: source -> processor');
+
+    // CRITICAL FIX for Edge: ScriptProcessorNode requires connection to destination
+    // to actually fire onaudioprocess events. We connect with volume set to 0 to avoid feedback.
+    gainNode = audioContext.createGain();
+    gainNode.gain.value = 0; // Mute to prevent audio feedback
+    console.log('*** About to connect: processor -> gainNode -> destination');
+    processor.connect(gainNode);
+    gainNode.connect(audioContext.destination);
+    console.log('*** Full audio graph connected');
+
+    // EDGE WORKAROUND: Force AudioContext to start processing by connecting a dummy oscillator
+    // This seems to be required to "wake up" the audio graph in Edge
+    const dummyOscillator = audioContext.createOscillator();
+    dummyOscillator.frequency.value = 0; // Silent
+    const dummyGain = audioContext.createGain();
+    dummyGain.gain.value = 0;
+    dummyOscillator.connect(dummyGain);
+    dummyGain.connect(audioContext.destination);
+    dummyOscillator.start();
+    console.log('*** Dummy oscillator started to wake up audio graph');
+
+    console.log('Audio initialized - AudioContext state:', audioContext.state);
+    console.log('Processor connected to muted destination for Edge compatibility');
+
+    // Wait a bit for audio graph to stabilize
+    await new Promise(resolve => setTimeout(resolve, 100));
+    console.log('*** Audio graph stabilized, ready for recording');
 }
 
 // WebSocket handling
@@ -375,7 +436,7 @@ function initializeWebSocket() {
 // Recording control
 async function startRecording() {
     if (isRecording) return;
-    
+
     try {
         // Ensure WebSocket is connected before starting
         if (!wsConnected) {
@@ -383,33 +444,44 @@ async function startRecording() {
             // Wait a bit for connection to establish
             await new Promise(resolve => setTimeout(resolve, 1000));
         }
-        
+
         transcript.value = '';
         enhancedTranscript.value = '';
 
         if (!streamInitialized) {
-            stream = await navigator.mediaDevices.getUserMedia({ 
+            console.log('Requesting microphone access...');
+            stream = await navigator.mediaDevices.getUserMedia({
                 audio: {
                     channelCount: 1,
                     echoCancellation: true,
                     noiseSuppression: true,
                     autoGainControl: true
-                } 
+                }
             });
+            console.log('Microphone access granted, stream:', stream);
+            console.log('Audio tracks:', stream.getAudioTracks());
             streamInitialized = true;
             updateHeading();
         }
 
         if (!stream) throw new Error('Failed to initialize audio stream');
-        if (!audioContext || !processor || !source) await initAudio(stream);
+        if (!audioContext || !processor || !source) {
+            console.log('Initializing audio context and processor...');
+            await initAudio(stream);
+        }
 
         isRecording = true;
+        console.log('*** RECORDING STARTED - isRecording:', isRecording);
+        console.log('*** Processor exists:', !!processor);
+        console.log('*** Source exists:', !!source);
+        console.log('*** GainNode exists:', !!gainNode);
+
         await ws.send(JSON.stringify({ type: 'start_recording' }));
-        
+
         startTimer();
         recordButton.textContent = 'Stop';
         recordButton.classList.add('recording');
-        
+
         updateHeading();
     } catch (error) {
         console.error('Error starting recording:', error);
