@@ -180,6 +180,15 @@ If you encounter issues with hosting:
 - **Can't access from other devices:** Ensure you're using `--host 0.0.0.0` and check your firewall settings
 - **Environment variables not found:** Make sure `OPENAI_API_KEY` is set in your shell session
 
+### Browser Troubleshooting
+
+**Microsoft Edge Installed App Issues:**
+
+If Brainwave is installed as an app in Microsoft Edge, it may occasionally stop recording audio. When this happens:
+
+1. **Verify the fix will work:** Open Brainwave in an Edge private/incognito window. If it works there, this confirms the issue is with the installed app.
+2. **Solution:** Uninstall the installed app and reinstall it. This will restore recording functionality.
+
 ### Additional uv Commands
 
 Here are useful uv commands for managing your development environment:
