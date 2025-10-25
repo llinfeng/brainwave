@@ -189,6 +189,10 @@ If Brainwave is installed as an app in Microsoft Edge, it may occasionally stop 
 1. **Verify the fix will work:** Open Brainwave in an Edge private/incognito window. If it works there, this confirms the issue is with the installed app.
 2. **Solution:** Uninstall the installed app and reinstall it. This will restore recording functionality.
 
+**Sound Wave Indicator Issues:**
+
+The sound wave indicator may not work properly in Firefox. If the indicator doesn't animate during recording (but recording itself works), switch to Chrome or Microsoft Edge where the indicator has been tested and works reliably.
+
 ### Additional uv Commands
 
 Here are useful uv commands for managing your development environment:
