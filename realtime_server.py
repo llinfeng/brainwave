@@ -90,6 +90,10 @@ class AudioProcessor:
         self.current_transcription = []
         self.audio_buffer = []  # Add audio buffer as instance variable
         self.current_filename = None  # Cache for generated filename
+        self._transcript_header_line = "下面是语音识别转录结果："
+        self._expected_header = f"{self._transcript_header_line}\n\n"
+        self._header_buffer = ""
+        self._header_removed = False
 
     def process_audio_chunk(self, audio_data):
         # Convert binary audio data to Int16 array
@@ -120,15 +124,66 @@ class AudioProcessor:
         self.current_transcription = []
         self.audio_buffer = []  # Clear audio buffer for new session
         self.current_filename = None  # Reset cached filename for new session
+        self._header_buffer = ""
+        self._header_removed = False
         return self.current_session_id
 
     def add_transcription_text(self, text):
         """Add transcription text to the current session"""
-        if self.current_session_id:
-            self.current_transcription.append(text)
-            logger.debug(f"Added text to transcription: '{text}', total pieces: {len(self.current_transcription)}")
-        else:
+        if not self.current_session_id:
             logger.warning(f"No session ID when trying to add text: '{text}'")
+            return text
+
+        cleaned_text = self._strip_transcript_header(text)
+        if cleaned_text:
+            self.current_transcription.append(cleaned_text)
+            logger.debug(f"Added text to transcription: '{cleaned_text}', total pieces: {len(self.current_transcription)}")
+        return cleaned_text
+
+    @staticmethod
+    def strip_transcript_header(text: str) -> str:
+        """Remove the fixed header line from a full transcript string."""
+        header_line = "下面是语音识别转录结果："
+        if text.startswith(header_line):
+            remainder = text[len(header_line):]
+            return remainder.lstrip("\r\n")
+        return text
+
+    def _strip_transcript_header(self, text: str) -> str:
+        """Remove the fixed header line from the streaming transcript output."""
+        if self._header_removed:
+            return text
+
+        combined = f"{self._header_buffer}{text}"
+        header = self._expected_header
+        header_line = self._transcript_header_line
+
+        if header.startswith(combined):
+            # Still collecting header characters
+            self._header_buffer = combined
+            if len(self._header_buffer) == len(header):
+                self._header_buffer = ""
+                self._header_removed = True
+            return ""
+
+        if combined.startswith(header):
+            # Header fully matched; remove it and mark as removed
+            self._header_removed = True
+            self._header_buffer = ""
+            return combined[len(header):]
+
+        if combined.startswith(header_line):
+            # Header line present but whitespace differs; strip line and leading newlines
+            remainder = combined[len(header_line):].lstrip("\r\n")
+            self._header_removed = True
+            self._header_buffer = ""
+            return remainder
+
+        # Header missing or altered: release buffered text and stop filtering
+        self._header_removed = True
+        buffered = self._header_buffer
+        self._header_buffer = ""
+        return f"{buffered}{text}"
 
     def generate_content_filename(self, text_content):
         """Generate a descriptive filename from transcribed text content, caching the result for reuse."""
@@ -328,14 +383,17 @@ async def websocket_endpoint(websocket: WebSocket):
             if websocket.client_state == WebSocketState.CONNECTED:
                 text_delta = data.get("delta", "")
                 logger.info(f"Received text delta: '{text_delta}'")
-                audio_processor.add_transcription_text(text_delta)
+                cleaned_text = audio_processor.add_transcription_text(text_delta)
                 logger.info(f"Current transcription length: {len(''.join(audio_processor.current_transcription))}")
-                await websocket.send_text(json.dumps({
-                    "type": "text",
-                    "content": text_delta,
-                    "isNewResponse": False
-                }))
-                logger.info("Handled response.text.delta")
+                if cleaned_text:
+                    await websocket.send_text(json.dumps({
+                        "type": "text",
+                        "content": cleaned_text,
+                        "isNewResponse": False
+                    }))
+                    logger.info("Handled response.text.delta")
+                else:
+                    logger.debug("Filtered transcript header chunk from response stream")
         except Exception as e:
             logger.error(f"Error in handle_text_delta: {str(e)}", exc_info=True)
 
@@ -714,6 +772,7 @@ async def upload_wav(file: UploadFile = File(...)):
             
             # Return the collected response
             full_response = ''.join(response_text)
+            full_response = AudioProcessor.strip_transcript_header(full_response)
             logger.info(f"Successfully processed WAV file with Realtime API: {file.filename}")
             logger.info(f"Response length: {len(full_response)} characters")
             
@@ -783,4 +842,3 @@ async def upload_wav_whisper(file: UploadFile = File(...)):
 
 if __name__ == '__main__':
     uvicorn.run(app, host="0.0.0.0", port=3005)
-
