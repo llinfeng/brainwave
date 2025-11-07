@@ -141,6 +141,14 @@ Deploying **Brainwave** involves setting up a Python-based environment, installi
 
    If not set, recordings will be saved to a `recordings` directory in the project folder.
 
+   Brainwave now writes a timestamped fail-safe WAV for every session, even if
+   the realtime OpenAI connection fails or drops mid-stream. These safeguard files
+   share the same directory (or your custom `BRAINWAVE_RECORDINGS_DIR`) and are
+   named with the session's time tag (for example, `20240805_132233.wav`). Once
+   the descriptive WAV _and_ matching transcript are written successfully, the
+   temporary timestamp file is cleaned up automatically; otherwise it stays put
+   as your fail-safe copy.
+
 4. **Launch the Server**
 
    Start the FastAPI server using uv:

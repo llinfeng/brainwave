@@ -94,6 +94,10 @@ class AudioProcessor:
         self._expected_header = f"{self._transcript_header_line}\n\n"
         self._header_buffer = ""
         self._header_removed = False
+        self.session_active = False
+        self.saved_paths = {}
+        self.latest_audio_path = None
+        self.latest_transcription_path = None
 
     def process_audio_chunk(self, audio_data):
         # Convert binary audio data to Int16 array
@@ -126,7 +130,26 @@ class AudioProcessor:
         self.current_filename = None  # Reset cached filename for new session
         self._header_buffer = ""
         self._header_removed = False
+        self.session_active = True
+        self.saved_paths = {}
+        self.latest_audio_path = None
+        self.latest_transcription_path = None
         return self.current_session_id
+
+    def has_active_session(self):
+        return self.session_active and self.current_session_id is not None
+
+    def end_session(self):
+        self.session_active = False
+        self.current_session_id = None
+        self.current_transcription = []
+        self.audio_buffer = []
+        self.current_filename = None
+        self._header_buffer = ""
+        self._header_removed = False
+        self.saved_paths = {}
+        self.latest_audio_path = None
+        self.latest_transcription_path = None
 
     def add_transcription_text(self, text):
         """Add transcription text to the current session"""
@@ -249,8 +272,14 @@ class AudioProcessor:
             self.current_filename = fallback_name
             return fallback_name
 
-    def save_audio_buffer(self, session_id=None):
-        """Save the audio buffer as a WAV file with content-based naming"""
+    def save_audio_buffer(self, session_id=None, strategy="content"):
+        """Save the audio buffer as a WAV file.
+
+        strategy: 'content' for descriptive filenames, 'timestamp' for fail-safe saves.
+        """
+        if strategy not in ("content", "timestamp"):
+            raise ValueError(f"Unknown save strategy: {strategy}")
+
         if not session_id:
             session_id = self.current_session_id
 
@@ -262,24 +291,38 @@ class AudioProcessor:
             logger.warning("No audio data to save")
             return
 
-        # Generate content-based filename
-        full_text = ''.join(self.current_transcription)
-        logger.info(f"Full transcription text for audio save: {full_text[:200]}...")
-        logger.info(f"Transcription length: {len(full_text)} characters")
+        filename = session_id
+        if strategy == "content":
+            full_text = ''.join(self.current_transcription)
+            logger.info(f"Full transcription text for audio save: {full_text[:200]}...")
+            logger.info(f"Transcription length: {len(full_text)} characters")
+            filename = self.generate_content_filename(full_text)
 
-        filename = self.generate_content_filename(full_text)
         wav_path = os.path.join(RECORDINGS_DIR, f"{filename}.wav")
+
+        existing_path = self.saved_paths.get(strategy)
+        if existing_path:
+            if os.path.exists(existing_path):
+                logger.info(f"Audio already saved using strategy '{strategy}' at {existing_path}, skipping duplicate write")
+                return existing_path
+            logger.warning(f"Previously saved path {existing_path} missing, rewriting audio file")
 
         logger.info(f"Saving audio with filename: {filename}")
         logger.info(f"Full audio path: {wav_path}")
 
+        self._write_audio_file(wav_path)
+
+        self.saved_paths[strategy] = wav_path
+        self.latest_audio_path = wav_path
+        logger.info(f"Saved audio recording to {wav_path}")
+        return wav_path
+
+    def _write_audio_file(self, wav_path):
         with wave.open(wav_path, 'wb') as wf:
             wf.setnchannels(1)  # Mono audio
             wf.setsampwidth(2)  # 2 bytes per sample (16-bit)
             wf.setframerate(self.target_sample_rate)
             wf.writeframes(b''.join(self.audio_buffer))
-
-        logger.info(f"Saved audio recording to {wav_path}")
 
     def save_transcription(self, session_id=None):
         """Save the transcription as a text file with content-based naming and UTF-8-BOM encoding"""
@@ -307,6 +350,28 @@ class AudioProcessor:
             # Write content encoded as UTF-8
             f.write(full_text.encode('utf-8'))
         logger.info(f"Saved transcription to {txt_path} with UTF-8-BOM encoding")
+        self.latest_transcription_path = txt_path
+        return txt_path
+
+    def cleanup_timestamp_backup(self):
+        """Remove the pure timestamp WAV once descriptive copies exist."""
+        timestamp_path = self.saved_paths.get("timestamp")
+        content_path = self.saved_paths.get("content")
+        transcription_path = self.latest_transcription_path
+
+        if not timestamp_path:
+            return
+
+        if (
+            content_path and os.path.exists(content_path)
+            and transcription_path and os.path.exists(transcription_path)
+        ):
+            try:
+                os.remove(timestamp_path)
+                logger.info(f"Removed fail-safe timestamp recording {timestamp_path} after successful save")
+                self.saved_paths.pop("timestamp", None)
+            except Exception as e:
+                logger.error(f"Failed to remove timestamp recording {timestamp_path}: {e}", exc_info=True)
 
 @app.websocket("/api/v1/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -331,6 +396,7 @@ async def websocket_endpoint(websocket: WebSocket):
     audio_send_lock = asyncio.Lock()
     all_audio_sent = asyncio.Event()
     all_audio_sent.set()  # Initially set since no audio is pending
+    finalize_lock = asyncio.Lock()
 
 
     async def initialize_openai():
@@ -342,9 +408,6 @@ async def websocket_endpoint(websocket: WebSocket):
             client = OpenAIRealtimeAudioTextClient(os.getenv("OPENAI_API_KEY"))
             await client.connect()
             logger.info("Successfully connected to OpenAI client")
-
-            # Start a new recording session
-            audio_processor.start_new_session()
 
             # Register handlers after client is initialized
             client.register_handler("session.updated", lambda data: handle_generic_event("session.updated", data))
@@ -371,6 +434,13 @@ async def websocket_endpoint(websocket: WebSocket):
         except Exception as e:
             logger.error(f"Failed to connect to OpenAI: {e}", exc_info=True)
             openai_ready.clear()  # Ensure flag is cleared on failure
+            if client:
+                try:
+                    await client.close()
+                except Exception as close_error:
+                    logger.error(f"Error closing partially initialized OpenAI client: {close_error}", exc_info=True)
+                finally:
+                    client = None
             await websocket.send_text(json.dumps({
                 "type": "error",
                 "content": "Failed to initialize OpenAI connection"
@@ -408,40 +478,75 @@ async def websocket_endpoint(websocket: WebSocket):
     async def handle_error(data):
         error_msg = data.get("error", {}).get("message", "Unknown error")
         logger.error(f"OpenAI error: {error_msg}")
-        await websocket.send_text(json.dumps({
-            "type": "error",
-            "content": error_msg
-        }))
+        try:
+            await websocket.send_text(json.dumps({
+                "type": "error",
+                "content": error_msg
+            }))
+        except Exception as e:
+            logger.error(f"Failed to notify client about error: {e}", exc_info=True)
         logger.info("Handled error message from OpenAI")
+        await finalize_recording(success=False, reason="openai_error")
 
     async def handle_response_done(data):
-        nonlocal client
         logger.info("Handled response.done")
-        recording_stopped.set()
-
-        if client:
-            try:
-                # Save the audio and transcription files
-                audio_processor.save_audio_buffer()
-                audio_processor.save_transcription()
-
-                await client.close()
-                client = None
-                openai_ready.clear()
-                await websocket.send_text(json.dumps({
-                    "type": "status",
-                    "status": "idle"
-                }))
-                # Tell frontend to clean up audio resources
-                await websocket.send_text(json.dumps({
-                    "type": "cleanup_audio"
-                }))
-                logger.info("Connection closed after response completion")
-            except Exception as e:
-                logger.error(f"Error in handle_response_done: {str(e)}", exc_info=True)
+        await finalize_recording(success=True, reason="response_done")
 
     async def handle_generic_event(event_type, data):
         logger.info(f"Handled {event_type} with data: {json.dumps(data, ensure_ascii=False)}")
+
+    async def finalize_recording(success=False, reason=""):
+        nonlocal client, pending_audio_chunks, pending_audio_operations
+
+        async with finalize_lock:
+            logger.info(f"Finalizing recording (success={success}, reason={reason})")
+            if audio_processor.has_active_session():
+                strategy = "content" if success else "timestamp"
+                audio_path = None
+                transcription_path = None
+                try:
+                    audio_path = audio_processor.save_audio_buffer(strategy=strategy)
+                except Exception as e:
+                    logger.error(f"Failed to save audio buffer during finalize: {e}", exc_info=True)
+                try:
+                    transcription_path = audio_processor.save_transcription()
+                except Exception as e:
+                    logger.error(f"Failed to save transcription during finalize: {e}", exc_info=True)
+
+                if success and audio_path and transcription_path:
+                    audio_processor.cleanup_timestamp_backup()
+
+                audio_processor.end_session()
+            else:
+                logger.debug("No active session to finalize")
+
+            pending_audio_chunks.clear()
+            pending_audio_operations = 0
+            all_audio_sent.set()
+            recording_stopped.set()
+
+            if client:
+                try:
+                    await client.close()
+                except Exception as e:
+                    logger.error(f"Error closing OpenAI client during finalize: {e}", exc_info=True)
+                finally:
+                    client = None
+
+            openai_ready.clear()
+
+            if websocket.client_state == WebSocketState.CONNECTED:
+                for payload in (
+                    {"type": "status", "status": "idle"},
+                    {"type": "cleanup_audio"},
+                ):
+                    try:
+                        await websocket.send_text(json.dumps(payload))
+                    except Exception as e:
+                        logger.error(f"Failed to send finalize payload {payload.get('type')}: {e}", exc_info=True)
+                        break
+
+            logger.info("Finalize recording completed")
 
     # Create a queue to handle incoming audio chunks
     audio_queue = asyncio.Queue()
@@ -474,12 +579,20 @@ async def websocket_endpoint(websocket: WebSocket):
                                 all_audio_sent.clear()  # Clear the event since we have pending operations
 
                             try:
-                                await client.send_audio(processed_audio)
+                                await asyncio.wait_for(client.send_audio(processed_audio), timeout=2.0)
                                 await websocket.send_text(json.dumps({
                                     "type": "status",
                                     "status": "connected"
                                 }))
                                 logger.debug(f"Sent audio chunk, size: {len(processed_audio)} bytes")
+                            except asyncio.TimeoutError:
+                                logger.error("Timeout sending audio chunk to OpenAI, finalizing recording for fail-safe save")
+                                await finalize_recording(success=False, reason="send_audio_timeout")
+                                break
+                            except Exception as e:
+                                logger.error(f"Error sending audio chunk to OpenAI: {e}", exc_info=True)
+                                await finalize_recording(success=False, reason="send_audio_failure")
+                                break
                             finally:
                                 # Mark operation as complete
                                 async with audio_send_lock:
@@ -493,15 +606,23 @@ async def websocket_endpoint(websocket: WebSocket):
                         msg = json.loads(data["text"])
 
                         if msg.get("type") == "start_recording":
+                            if audio_processor.has_active_session():
+                                logger.warning("Start recording requested while a session is active. Finalizing previous session first.")
+                                await finalize_recording(success=False, reason="duplicate_start")
+
+                            audio_processor.start_new_session()
+                            recording_stopped.clear()
+                            pending_audio_chunks.clear()
+
                             # Update status to connecting while initializing OpenAI
                             await websocket.send_text(json.dumps({
                                 "type": "status",
                                 "status": "connecting"
                             }))
+
                             if not await initialize_openai():
+                                logger.warning("OpenAI initialization failed; continuing in local fail-safe mode")
                                 continue
-                            recording_stopped.clear()
-                            pending_audio_chunks.clear()
 
                             # Send any buffered chunks
                             if pending_audio_chunks and client:
@@ -517,7 +638,15 @@ async def websocket_endpoint(websocket: WebSocket):
                                         all_audio_sent.clear()
 
                                     try:
-                                        await client.send_audio(chunk)
+                                        await asyncio.wait_for(client.send_audio(chunk), timeout=2.0)
+                                    except asyncio.TimeoutError:
+                                        logger.error("Timeout sending buffered chunk to OpenAI, finalizing recording for fail-safe save")
+                                        await finalize_recording(success=False, reason="send_buffered_timeout")
+                                        break
+                                    except Exception as e:
+                                        logger.error(f"Error sending buffered audio chunk to OpenAI: {e}", exc_info=True)
+                                        await finalize_recording(success=False, reason="send_buffered_failure")
+                                        break
                                     finally:
                                         async with audio_send_lock:
                                             pending_audio_operations -= 1
@@ -526,6 +655,12 @@ async def websocket_endpoint(websocket: WebSocket):
                                 pending_audio_chunks.clear()
 
                         elif msg.get("type") == "stop_recording":
+                            # Always ensure a local fail-safe file exists as soon as recording stops
+                            try:
+                                audio_processor.save_audio_buffer(strategy="timestamp")
+                            except Exception as e:
+                                logger.error(f"Failed to save fail-safe recording on stop: {e}", exc_info=True)
+
                             if client:
                                 # CRITICAL FIX: Wait for all pending audio operations to complete
                                 # before committing to prevent data loss
@@ -546,19 +681,32 @@ async def websocket_endpoint(websocket: WebSocket):
                                 await asyncio.sleep(0.1)
 
                                 logger.info("All audio sent, committing audio buffer...")
-                                await client.commit_audio()
-                                
-                                # Debug: log the prompt being sent
-                                prompt_text = PROMPTS['paraphrase-gpt-realtime']
-                                logger.info(f"Sending prompt to realtime API: {prompt_text[:200]}...")
-                                await client.start_response(prompt_text)
-                                await recording_stopped.wait()
-                                # Don't close the client here, let the disconnect timer handle it
-                                # Update client status to connected (waiting for response)
-                                await websocket.send_text(json.dumps({
-                                    "type": "status",
-                                    "status": "connected"
-                                }))
+                                try:
+                                    # Timeout protection around network calls so we can fall back if OpenAI is unreachable
+                                    await asyncio.wait_for(client.commit_audio(), timeout=5.0)
+
+                                    # Debug: log the prompt being sent
+                                    prompt_text = PROMPTS['paraphrase-gpt-realtime']
+                                    logger.info(f"Sending prompt to realtime API: {prompt_text[:200]}...")
+                                    await asyncio.wait_for(client.start_response(prompt_text), timeout=5.0)
+                                    try:
+                                        await asyncio.wait_for(recording_stopped.wait(), timeout=15.0)
+                                    except asyncio.TimeoutError:
+                                        logger.warning("Timeout waiting for OpenAI response completion; finalizing with fail-safe save")
+                                        await finalize_recording(success=False, reason="response_timeout")
+                                        continue
+                                    # Don't close the client here, let the disconnect timer handle it
+                                    # Update client status to connected (waiting for response)
+                                    await websocket.send_text(json.dumps({
+                                        "type": "status",
+                                        "status": "connected"
+                                    }))
+                                except Exception as e:
+                                    logger.error(f"Error while finalizing stop recording: {e}", exc_info=True)
+                                    await finalize_recording(success=False, reason="stop_recording_failure")
+                            else:
+                                logger.info("Stop recording received but OpenAI client is not ready; saving fail-safe recording.")
+                                await finalize_recording(success=False, reason="stop_without_client")
 
                 except asyncio.TimeoutError:
                     logger.debug("No message received for 30 seconds")
@@ -568,12 +716,8 @@ async def websocket_endpoint(websocket: WebSocket):
                     break
 
         finally:
-            # Cleanup when the loop exits
-            if client:
-                try:
-                    await client.close()
-                except Exception as e:
-                    logger.error(f"Error closing client in receive_messages: {str(e)}")
+            # Ensure any in-progress recording is finalized when the loop exits
+            await finalize_recording(success=False, reason="receive_loop_exit")
             logger.info("Receive messages loop ended")
 
     async def send_audio_messages():
