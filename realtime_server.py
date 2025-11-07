@@ -47,6 +47,17 @@ except Exception as e:
     # Only log the error, do not raise or stop the server
     logger.error(f"Warning: Cannot access or write to recordings directory: {RECORDINGS_DIR}. Audio and transcript saving will be disabled.")
 
+TIMESTAMP_PATTERN = re.compile(r"\d{8}_\d{6}")
+
+
+def extract_time_tag_from_filename(filename: str) -> str:
+    """Extract timestamp token from a filename or fallback to current time."""
+    base_name = os.path.splitext(os.path.basename(filename))[0]
+    match = TIMESTAMP_PATTERN.search(base_name)
+    if match:
+        return match.group(0)
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
 # Pydantic models for request and response schemas
 class ReadabilityRequest(BaseModel):
     text: str = Field(..., description="The text to improve readability for.")
@@ -968,6 +979,26 @@ async def upload_wav_whisper(file: UploadFile = File(...)):
             
             logger.info(f"Successfully transcribed WAV file with Whisper: {file.filename}")
             logger.info(f"Transcription length: {len(transcript)} characters")
+
+            # Persist transcription using the timestamp embedded in the filename (if present)
+            transcript_text = transcript.strip()
+            session_id = extract_time_tag_from_filename(file.filename)
+            naming_processor = AudioProcessor()
+            naming_processor.current_session_id = session_id
+            naming_processor.current_transcription = [transcript_text]
+            naming_processor.current_filename = None
+            naming_processor._header_removed = True
+
+            txt_path = None
+            try:
+                txt_path = naming_processor.save_transcription()
+            except Exception as save_error:
+                logger.error(f"Failed to save Whisper transcription for {session_id}: {save_error}", exc_info=True)
+
+            if txt_path:
+                logger.info(f"Saved Whisper transcription to {txt_path}")
+            else:
+                logger.warning("Whisper transcription could not be saved; returning text response only.")
             
             # Return the transcription as a streaming response
             async def text_generator():

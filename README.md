@@ -147,7 +147,10 @@ Deploying **Brainwave** involves setting up a Python-based environment, installi
    named with the session's time tag (for example, `20240805_132233.wav`). Once
    the descriptive WAV _and_ matching transcript are written successfully, the
    temporary timestamp file is cleaned up automatically; otherwise it stays put
-   as your fail-safe copy.
+   as your fail-safe copy. If you later upload one of these timestamped WAVs via
+   the **Upload (Whisper)** button, Brainwave reuses the same time tag to store a
+   Whisper transcript in the recordings folder and gives that text file the same
+   summary-style name you’d normally get from a successful realtime session.
 
 4. **Launch the Server**
 
