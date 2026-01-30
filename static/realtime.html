@@ -18,17 +18,17 @@
         </div>
         
         <div class="mode-toggle-container">
-            <span class="mode-label">Realtime</span>
+            <div class="tooltip-container"><a href="https://platform.openai.com/docs/guides/realtime" target="_blank" class="mode-label">Realtime</a><span class="tooltip-text">OpenAI Realtime API. Streams audio live as you speak. Lowest latency. Click for details.</span></div>
             <label class="mode-toggle">
                 <input type="checkbox" id="modeToggle">
                 <span class="mode-slider"></span>
             </label>
-            <span class="mode-label">RESTful</span>
+            <div class="tooltip-container"><a href="https://platform.openai.com/docs/guides/speech-to-text" target="_blank" class="mode-label">RESTful</a><span class="tooltip-text">OpenAI Speech-to-Text API. Buffers audio, transcribes on stop. Better accuracy. Click for details.</span></div>
         </div>
         <div class="record-button-container">
-<div class="tooltip-container"><button id="whisperUploadButton" class="upload-button">Upload (Whisper)</button><span class="tooltip-text">Transcribes a WAV file using the Whisper API for a literal transcription.</span></div>
+<div class="tooltip-container"><button id="uploadButton" class="upload-button">Upload (Realtime)</button><span class="tooltip-text">Replicates live recording via Realtime API. Uses whisper-1 model internally.</span></div>
             <button id="recordButton">Start</button>
-<div class="tooltip-container"><button id="uploadButton" class="upload-button" title="Replicates the live recording process by sending a WAV file to the Realtime API.">Upload (Realtime)</button><span class="tooltip-text">Replicates the live recording process by sending a WAV file to the Realtime API.</span></div>
+<div class="tooltip-container"><button id="whisperUploadButton" class="upload-button">Upload (RESTful)</button><span class="tooltip-text">Transcribes via REST API (/v1/audio/transcriptions) using whisper-1 model. Literal transcription.</span></div>
             <input type="file" id="fileInput" accept=".wav" style="display: none;">
             <input type="file" id="whisperFileInput" accept=".wav" style="display: none;">
         </div>
