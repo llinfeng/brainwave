@@ -10,7 +10,8 @@
       "Bash(source:*)",
       "Bash(kill:*)",
       "Bash(echo:*)",
-      "WebFetch(domain:platform.openai.com)"
+      "WebFetch(domain:platform.openai.com)",
+      "WebSearch"
     ],
     "deny": [],
     "ask": []
