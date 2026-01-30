@@ -380,6 +380,29 @@ The test suite is designed to run without making actual API calls, making it sui
 
 ---
 
+## Notemap
+
+### Transcription Mode Toggle
+
+Brainwave supports two transcription modes, selectable via the UI toggle:
+
+| Mode | Description | Best For |
+|------|-------------|----------|
+| **Realtime** (default) | WebSocket streaming via OpenAI Realtime API | Live recording with lowest latency |
+| **RESTful** | REST API with SSE streaming using `gpt-4o-mini-transcribe` | Better accuracy, simpler architecture |
+
+Toggle the mode using the switch in the web interface. Your preference is saved automatically to localStorage and persists across sessions.
+
+**Technical Details:**
+
+- **Realtime mode**: Uses WebSocket connection to OpenAI's Realtime API (`wss://api.openai.com/v1/realtime`). Audio is streamed in real-time as you speak, providing immediate feedback.
+
+- **RESTful mode**: Buffers audio locally during recording, then sends the complete audio to OpenAI's REST API (`/audio/transcriptions`) with streaming enabled. Uses the `gpt-4o-mini-transcribe` model for transcription.
+
+Both modes support streaming output to minimize perceived latency, and both save transcripts and audio files to your configured recordings directory.
+
+---
+
 ## Conclusion
 
 **Brainwave** revolutionizes the way users capture and organize their ideas by providing a seamless speech recognition and summarization tool. Its real-time processing capabilities, combined with multilingual support and sophisticated text enhancement, make it an invaluable asset for anyone looking to efficiently manage their thoughts and ideas. Whether you're brainstorming, taking notes, or organizing project ideas, Brainwave ensures that your spoken words are transformed into clear, organized, and actionable summaries.

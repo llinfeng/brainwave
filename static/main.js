@@ -8,6 +8,9 @@ let wsConnected = false;
 let streamInitialized = false;
 let isAutoStarted = false;
 
+// Transcription mode: 'realtime' or 'restful'
+let transcriptionMode = localStorage.getItem('transcriptionMode') || 'realtime';
+
 // Soundwave visualization
 let soundwaveCanvas, soundwaveCtx;
 let soundwaveData = [];
@@ -102,6 +105,7 @@ const copyEnhancedButton = document.getElementById('copyEnhancedButton');
 const readabilityButton = document.getElementById('readabilityButton');
 const askAIButton = document.getElementById('askAIButton');
 const correctnessButton = document.getElementById('correctnessButton');
+const modeToggle = document.getElementById('modeToggle');
 
 // Configuration
 const targetSeconds = 5;
@@ -476,7 +480,7 @@ async function startRecording() {
         console.log('*** Source exists:', !!source);
         console.log('*** GainNode exists:', !!gainNode);
 
-        await ws.send(JSON.stringify({ type: 'start_recording' }));
+        await ws.send(JSON.stringify({ type: 'start_recording', mode: transcriptionMode }));
 
         startTimer();
         recordButton.textContent = 'Stop';
@@ -682,6 +686,7 @@ document.addEventListener('keydown', (event) => {
 document.addEventListener('DOMContentLoaded', () => {
     initializeWebSocket();
     initializeTheme();
+    initializeTranscriptionMode();
     initSoundwave();
     checkMicrophonePermission(); // Check mic permission status
     if (autoStart) initializeAudioStream();
@@ -838,5 +843,28 @@ function initializeTheme() {
     }
 }
 
+// Mode toggle handling
+function updateModeLabels() {
+    const labels = document.querySelectorAll('.mode-label');
+    if (labels.length >= 2) {
+        labels[0].classList.toggle('active', transcriptionMode === 'realtime');
+        labels[1].classList.toggle('active', transcriptionMode === 'restful');
+    }
+}
+
+function toggleTranscriptionMode() {
+    transcriptionMode = modeToggle.checked ? 'restful' : 'realtime';
+    localStorage.setItem('transcriptionMode', transcriptionMode);
+    updateModeLabels();
+    console.log('Transcription mode changed to:', transcriptionMode);
+}
+
+function initializeTranscriptionMode() {
+    // Set toggle state from saved preference
+    modeToggle.checked = transcriptionMode === 'restful';
+    updateModeLabels();
+}
+
 // Add to your existing event listeners
 document.getElementById('themeToggle').onclick = toggleTheme;
+modeToggle.onchange = toggleTranscriptionMode;

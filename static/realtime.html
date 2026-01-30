@@ -17,6 +17,14 @@
             <canvas id="soundwaveCanvas" width="600" height="80"></canvas>
         </div>
         
+        <div class="mode-toggle-container">
+            <span class="mode-label">Realtime</span>
+            <label class="mode-toggle">
+                <input type="checkbox" id="modeToggle">
+                <span class="mode-slider"></span>
+            </label>
+            <span class="mode-label">RESTful</span>
+        </div>
         <div class="record-button-container">
 <div class="tooltip-container"><button id="whisperUploadButton" class="upload-button">Upload (Whisper)</button><span class="tooltip-text">Transcribes a WAV file using the Whisper API for a literal transcription.</span></div>
             <button id="recordButton">Start</button>

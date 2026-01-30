@@ -353,3 +353,82 @@ body.dark-theme .gray-button {
 body.dark-theme .gray-button:hover {
     background-color: #48484A !important;
 }
+
+/* Mode Toggle Switch */
+.mode-toggle-container {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 12px;
+    margin: 15px 0;
+}
+
+.mode-label {
+    font-size: 0.9rem;
+    font-weight: 500;
+    color: #8E8E93;
+    transition: color 0.3s ease;
+}
+
+.mode-label.active {
+    color: #007AFF;
+    font-weight: 600;
+}
+
+body.dark-theme .mode-label.active {
+    color: #34C759;
+}
+
+.mode-toggle {
+    position: relative;
+    display: inline-block;
+    width: 50px;
+    height: 28px;
+}
+
+.mode-toggle input {
+    opacity: 0;
+    width: 0;
+    height: 0;
+}
+
+.mode-slider {
+    position: absolute;
+    cursor: pointer;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background-color: #007AFF;
+    transition: 0.3s;
+    border-radius: 28px;
+}
+
+.mode-slider:before {
+    position: absolute;
+    content: "";
+    height: 22px;
+    width: 22px;
+    left: 3px;
+    bottom: 3px;
+    background-color: white;
+    transition: 0.3s;
+    border-radius: 50%;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+}
+
+.mode-toggle input:checked + .mode-slider {
+    background-color: #34C759;
+}
+
+.mode-toggle input:checked + .mode-slider:before {
+    transform: translateX(22px);
+}
+
+body.dark-theme .mode-slider {
+    background-color: #34C759;
+}
+
+body.dark-theme .mode-toggle input:checked + .mode-slider {
+    background-color: #007AFF;
+}
