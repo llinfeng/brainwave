@@ -384,6 +384,68 @@ class AudioProcessor:
             except Exception as e:
                 logger.error(f"Failed to remove timestamp recording {timestamp_path}: {e}", exc_info=True)
 
+async def transcribe_with_rest_api(audio_data: bytes, websocket: WebSocket, audio_processor: AudioProcessor):
+    """Transcribe audio using REST API with SSE streaming using gpt-4o-mini-transcribe"""
+    client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+
+    # Create temp file for audio (WAV format at 24kHz mono)
+    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
+        tmp_path = f.name
+        with wave.open(f, 'wb') as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)  # 16-bit
+            wf.setframerate(24000)
+            wf.writeframes(audio_data)
+
+    try:
+        logger.info(f"Calling REST API transcription with file: {tmp_path}")
+
+        # Call transcription API with streaming
+        with open(tmp_path, 'rb') as audio_file:
+            stream = await client.audio.transcriptions.create(
+                model="gpt-4o-mini-transcribe",
+                file=audio_file,
+                response_format="text",
+                stream=True,
+            )
+
+            full_text = ""
+            async for event in stream:
+                if hasattr(event, 'type'):
+                    if event.type == "transcript.text.delta":
+                        delta = event.delta if hasattr(event, 'delta') else ""
+                        if delta:
+                            full_text += delta
+                            cleaned_text = audio_processor.add_transcription_text(delta)
+                            if cleaned_text and websocket.client_state == WebSocketState.CONNECTED:
+                                await websocket.send_text(json.dumps({
+                                    "type": "text",
+                                    "content": cleaned_text,
+                                    "isNewResponse": False
+                                }))
+                    elif event.type == "transcript.text.done":
+                        logger.info(f"REST API transcription complete, length: {len(full_text)}")
+                elif hasattr(event, 'text'):
+                    # Fallback for non-streaming response format
+                    full_text = event.text
+                    cleaned_text = audio_processor.add_transcription_text(full_text)
+                    if cleaned_text and websocket.client_state == WebSocketState.CONNECTED:
+                        await websocket.send_text(json.dumps({
+                            "type": "text",
+                            "content": cleaned_text,
+                            "isNewResponse": False
+                        }))
+
+            return full_text
+
+    except Exception as e:
+        logger.error(f"Error in REST API transcription: {e}", exc_info=True)
+        raise
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
 @app.websocket("/api/v1/ws")
 async def websocket_endpoint(websocket: WebSocket):
     logger.info("New WebSocket connection attempt")
@@ -401,6 +463,10 @@ async def websocket_endpoint(websocket: WebSocket):
     recording_stopped = asyncio.Event()
     openai_ready = asyncio.Event()
     pending_audio_chunks = []
+
+    # Track transcription mode for current session
+    current_mode = "realtime"  # Default mode
+    restful_audio_buffer = []  # Buffer for RESTful mode audio
 
     # Add synchronization for audio sending operations
     pending_audio_operations = 0
@@ -435,6 +501,7 @@ async def websocket_endpoint(websocket: WebSocket):
             client.register_handler("error", lambda data: handle_error(data))
             client.register_handler("response.text.delta", lambda data: handle_text_delta(data))
             client.register_handler("response.created", lambda data: handle_response_created(data))
+            client.register_handler("conversation.item.input_audio_transcription.failed", lambda data: handle_transcription_failed(data))
 
             openai_ready.set()  # Set ready flag after successful initialization
             await websocket.send_text(json.dumps({
@@ -487,17 +554,57 @@ async def websocket_endpoint(websocket: WebSocket):
         logger.info("Handled response.created")
 
     async def handle_error(data):
-        error_msg = data.get("error", {}).get("message", "Unknown error")
-        logger.error(f"OpenAI error: {error_msg}")
+        error_obj = data.get("error", {})
+        error_msg = error_obj.get("message", "Unknown error")
+        error_type = error_obj.get("type", "unknown")
+        error_code = error_obj.get("code", "")
+
+        full_error = f"OpenAI API Error [{error_type}]: {error_msg}"
+        if error_code:
+            full_error += f" (code: {error_code})"
+
+        logger.error(full_error)
         try:
             await websocket.send_text(json.dumps({
                 "type": "error",
-                "content": error_msg
+                "content": full_error
             }))
         except Exception as e:
             logger.error(f"Failed to notify client about error: {e}", exc_info=True)
         logger.info("Handled error message from OpenAI")
         await finalize_recording(success=False, reason="openai_error")
+
+    async def handle_transcription_failed(data):
+        """Handle transcription failure events from OpenAI Realtime API"""
+        error_obj = data.get("error", {})
+        error_msg = error_obj.get("message", "Transcription failed")
+        error_type = error_obj.get("type", "unknown")
+        error_code = error_obj.get("code", "")
+
+        # Build informative error message
+        full_error = f"Transcription Failed [{error_type}]: {error_msg}"
+        if error_code:
+            full_error += f" (code: {error_code})"
+
+        # Check for common error types and provide helpful context
+        if "quota" in error_msg.lower() or "insufficient_quota" in error_code:
+            full_error = f"OpenAI Quota Exceeded: {error_msg}. Please check your billing at https://platform.openai.com/account/billing"
+        elif "rate" in error_msg.lower() or "rate_limit" in error_type:
+            full_error = f"OpenAI Rate Limit: {error_msg}. Please wait and try again."
+
+        logger.error(f"Transcription failed: {full_error}")
+        logger.error(f"Full transcription failure data: {json.dumps(data, ensure_ascii=False)}")
+
+        try:
+            if websocket.client_state == WebSocketState.CONNECTED:
+                await websocket.send_text(json.dumps({
+                    "type": "error",
+                    "content": full_error
+                }))
+        except Exception as e:
+            logger.error(f"Failed to notify client about transcription failure: {e}", exc_info=True)
+
+        await finalize_recording(success=False, reason="transcription_failed")
 
     async def handle_response_done(data):
         logger.info("Handled response.done")
@@ -507,7 +614,7 @@ async def websocket_endpoint(websocket: WebSocket):
         logger.info(f"Handled {event_type} with data: {json.dumps(data, ensure_ascii=False)}")
 
     async def finalize_recording(success=False, reason=""):
-        nonlocal client, pending_audio_chunks, pending_audio_operations
+        nonlocal client, pending_audio_chunks, pending_audio_operations, restful_audio_buffer
 
         async with finalize_lock:
             logger.info(f"Finalizing recording (success={success}, reason={reason})")
@@ -532,6 +639,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 logger.debug("No active session to finalize")
 
             pending_audio_chunks.clear()
+            restful_audio_buffer.clear()
             pending_audio_operations = 0
             all_audio_sent.set()
             recording_stopped.set()
@@ -563,7 +671,7 @@ async def websocket_endpoint(websocket: WebSocket):
     audio_queue = asyncio.Queue()
 
     async def receive_messages():
-        nonlocal client
+        nonlocal client, current_mode, restful_audio_buffer, pending_audio_operations
 
         try:
             while True:
@@ -578,14 +686,18 @@ async def websocket_endpoint(websocket: WebSocket):
 
                     if "bytes" in data:
                         processed_audio = audio_processor.process_audio_chunk(data["bytes"])
-                        if not openai_ready.is_set():
+
+                        if current_mode == "restful":
+                            # RESTful mode: Buffer audio locally
+                            restful_audio_buffer.append(processed_audio)
+                            logger.debug(f"RESTful mode: Buffered audio chunk, size: {len(processed_audio)} bytes, total chunks: {len(restful_audio_buffer)}")
+                        elif not openai_ready.is_set():
                             logger.debug("OpenAI not ready, buffering audio chunk")
                             pending_audio_chunks.append(processed_audio)
                         elif client and not recording_stopped.is_set():
                             # Safety check: Only send audio if recording is still active
                             # Track pending audio operations
                             async with audio_send_lock:
-                                nonlocal pending_audio_operations
                                 pending_audio_operations += 1
                                 all_audio_sent.clear()  # Clear the event since we have pending operations
 
@@ -621,49 +733,63 @@ async def websocket_endpoint(websocket: WebSocket):
                                 logger.warning("Start recording requested while a session is active. Finalizing previous session first.")
                                 await finalize_recording(success=False, reason="duplicate_start")
 
+                            # Get the transcription mode from the message
+                            current_mode = msg.get("mode", "realtime")
+                            logger.info(f"Starting recording in {current_mode} mode")
+
                             audio_processor.start_new_session()
                             recording_stopped.clear()
                             pending_audio_chunks.clear()
+                            restful_audio_buffer.clear()
 
-                            # Update status to connecting while initializing OpenAI
+                            # Update status to connecting while initializing
                             await websocket.send_text(json.dumps({
                                 "type": "status",
                                 "status": "connecting"
                             }))
 
-                            if not await initialize_openai():
-                                logger.warning("OpenAI initialization failed; continuing in local fail-safe mode")
-                                continue
+                            if current_mode == "realtime":
+                                # Realtime mode: Initialize OpenAI Realtime API
+                                if not await initialize_openai():
+                                    logger.warning("OpenAI initialization failed; continuing in local fail-safe mode")
+                                    continue
 
-                            # Send any buffered chunks
-                            if pending_audio_chunks and client:
-                                logger.info(f"Sending {len(pending_audio_chunks)} buffered chunks")
-                                for chunk in pending_audio_chunks:
-                                    # Safety check: Stop sending if recording has been stopped
-                                    if recording_stopped.is_set():
-                                        logger.info("Recording stopped while sending buffered chunks, stopping transmission")
-                                        break
-                                    # Track each buffered chunk operation
-                                    async with audio_send_lock:
-                                        pending_audio_operations += 1
-                                        all_audio_sent.clear()
-
-                                    try:
-                                        await asyncio.wait_for(client.send_audio(chunk), timeout=2.0)
-                                    except asyncio.TimeoutError:
-                                        logger.error("Timeout sending buffered chunk to OpenAI, finalizing recording for fail-safe save")
-                                        await finalize_recording(success=False, reason="send_buffered_timeout")
-                                        break
-                                    except Exception as e:
-                                        logger.error(f"Error sending buffered audio chunk to OpenAI: {e}", exc_info=True)
-                                        await finalize_recording(success=False, reason="send_buffered_failure")
-                                        break
-                                    finally:
+                                # Send any buffered chunks
+                                if pending_audio_chunks and client:
+                                    logger.info(f"Sending {len(pending_audio_chunks)} buffered chunks")
+                                    for chunk in pending_audio_chunks:
+                                        # Safety check: Stop sending if recording has been stopped
+                                        if recording_stopped.is_set():
+                                            logger.info("Recording stopped while sending buffered chunks, stopping transmission")
+                                            break
+                                        # Track each buffered chunk operation
                                         async with audio_send_lock:
-                                            pending_audio_operations -= 1
-                                            if pending_audio_operations == 0:
-                                                all_audio_sent.set()
-                                pending_audio_chunks.clear()
+                                            pending_audio_operations += 1
+                                            all_audio_sent.clear()
+
+                                        try:
+                                            await asyncio.wait_for(client.send_audio(chunk), timeout=2.0)
+                                        except asyncio.TimeoutError:
+                                            logger.error("Timeout sending buffered chunk to OpenAI, finalizing recording for fail-safe save")
+                                            await finalize_recording(success=False, reason="send_buffered_timeout")
+                                            break
+                                        except Exception as e:
+                                            logger.error(f"Error sending buffered audio chunk to OpenAI: {e}", exc_info=True)
+                                            await finalize_recording(success=False, reason="send_buffered_failure")
+                                            break
+                                        finally:
+                                            async with audio_send_lock:
+                                                pending_audio_operations -= 1
+                                                if pending_audio_operations == 0:
+                                                    all_audio_sent.set()
+                                    pending_audio_chunks.clear()
+                            else:
+                                # RESTful mode: Just mark as connected, we'll buffer audio locally
+                                await websocket.send_text(json.dumps({
+                                    "type": "status",
+                                    "status": "connected"
+                                }))
+                                logger.info("RESTful mode: Ready to buffer audio locally")
 
                         elif msg.get("type") == "stop_recording":
                             # Always ensure a local fail-safe file exists as soon as recording stops
@@ -672,7 +798,50 @@ async def websocket_endpoint(websocket: WebSocket):
                             except Exception as e:
                                 logger.error(f"Failed to save fail-safe recording on stop: {e}", exc_info=True)
 
-                            if client:
+                            if current_mode == "restful":
+                                # RESTful mode: Send buffered audio to REST API for transcription
+                                logger.info(f"RESTful mode: Processing {len(restful_audio_buffer)} buffered audio chunks")
+
+                                if restful_audio_buffer:
+                                    # Combine all buffered audio into one
+                                    combined_audio = b''.join(restful_audio_buffer)
+                                    logger.info(f"RESTful mode: Total audio size: {len(combined_audio)} bytes")
+
+                                    # Send new response indicator
+                                    await websocket.send_text(json.dumps({
+                                        "type": "text",
+                                        "content": "",
+                                        "isNewResponse": True
+                                    }))
+
+                                    try:
+                                        await transcribe_with_rest_api(combined_audio, websocket, audio_processor)
+                                        await finalize_recording(success=True, reason="restful_complete")
+                                    except Exception as e:
+                                        logger.error(f"RESTful transcription failed: {e}", exc_info=True)
+                                        # Parse OpenAI-specific errors for better user feedback
+                                        error_msg = str(e)
+                                        if hasattr(e, 'status_code'):
+                                            if e.status_code == 429:
+                                                if 'insufficient_quota' in error_msg.lower() or 'quota' in error_msg.lower():
+                                                    error_msg = "OpenAI Quota Exceeded: Please check your billing at https://platform.openai.com/account/billing"
+                                                else:
+                                                    error_msg = "OpenAI Rate Limit: Too many requests. Please wait and try again."
+                                            elif e.status_code == 401:
+                                                error_msg = "OpenAI Authentication Failed: Please check your API key."
+                                            elif e.status_code == 400:
+                                                error_msg = f"OpenAI Bad Request: {error_msg}"
+                                        await websocket.send_text(json.dumps({
+                                            "type": "error",
+                                            "content": error_msg
+                                        }))
+                                        await finalize_recording(success=False, reason="restful_error")
+                                else:
+                                    logger.warning("RESTful mode: No audio data buffered")
+                                    await finalize_recording(success=False, reason="no_audio_data")
+
+                            elif client:
+                                # Realtime mode: Use existing OpenAI Realtime API flow
                                 # CRITICAL FIX: Wait for all pending audio operations to complete
                                 # before committing to prevent data loss
                                 logger.info("Stop recording received, waiting for all audio to be sent...")
@@ -943,7 +1112,19 @@ async def upload_wav(file: UploadFile = File(...)):
     
     except Exception as e:
         logger.error(f"Error processing WAV file: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Error processing WAV file: {str(e)}")
+        # Parse OpenAI-specific errors for better user feedback
+        error_msg = str(e)
+        status_code = 500
+        if hasattr(e, 'status_code'):
+            status_code = e.status_code
+            if e.status_code == 429:
+                if 'insufficient_quota' in error_msg.lower() or 'quota' in error_msg.lower():
+                    error_msg = "OpenAI Quota Exceeded: Please check your billing at https://platform.openai.com/account/billing"
+                else:
+                    error_msg = "OpenAI Rate Limit: Too many requests. Please wait and try again."
+            elif e.status_code == 401:
+                error_msg = "OpenAI Authentication Failed: Please check your API key."
+        raise HTTPException(status_code=status_code, detail=error_msg)
 
 @app.post(
     "/api/v1/upload_wav_whisper",
@@ -1013,7 +1194,19 @@ async def upload_wav_whisper(file: UploadFile = File(...)):
     
     except Exception as e:
         logger.error(f"Error processing WAV file with Whisper: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Error processing WAV file with Whisper: {str(e)}")
+        # Parse OpenAI-specific errors for better user feedback
+        error_msg = str(e)
+        status_code = 500
+        if hasattr(e, 'status_code'):
+            status_code = e.status_code
+            if e.status_code == 429:
+                if 'insufficient_quota' in error_msg.lower() or 'quota' in error_msg.lower():
+                    error_msg = "OpenAI Quota Exceeded: Please check your billing at https://platform.openai.com/account/billing"
+                else:
+                    error_msg = "OpenAI Rate Limit: Too many requests. Please wait and try again."
+            elif e.status_code == 401:
+                error_msg = "OpenAI Authentication Failed: Please check your API key."
+        raise HTTPException(status_code=status_code, detail=error_msg)
 
 if __name__ == '__main__':
     uvicorn.run(app, host="0.0.0.0", port=3005)
