@@ -480,7 +480,7 @@ async function startRecording() {
         console.log('*** Source exists:', !!source);
         console.log('*** GainNode exists:', !!gainNode);
 
-        await ws.send(JSON.stringify({ type: 'start_recording', mode: transcriptionMode }));
+        await ws.send(JSON.stringify({ type: 'start_recording', mode: transcriptionMode, sample_rate: audioContext.sampleRate }));
 
         startTimer();
         recordButton.textContent = 'Stop';

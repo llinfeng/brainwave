@@ -733,6 +733,11 @@ async def websocket_endpoint(websocket: WebSocket):
                                 logger.warning("Start recording requested while a session is active. Finalizing previous session first.")
                                 await finalize_recording(success=False, reason="duplicate_start")
 
+                            # Get sample rate from browser (default to 48000 if not provided)
+                            source_sample_rate = msg.get("sample_rate", 48000)
+                            audio_processor.source_sample_rate = source_sample_rate
+                            logger.info(f"Browser sample rate: {source_sample_rate}Hz")
+
                             # Get the transcription mode from the message
                             current_mode = msg.get("mode", "realtime")
                             logger.info(f"Starting recording in {current_mode} mode")
