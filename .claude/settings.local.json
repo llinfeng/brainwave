@@ -11,7 +11,11 @@
       "Bash(kill:*)",
       "Bash(echo:*)",
       "WebFetch(domain:platform.openai.com)",
-      "WebSearch"
+      "WebSearch",
+      "Bash(python3 -c \"import scipy.signal; help\\(scipy.signal.resample_poly\\)\")",
+      "Bash(python3:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)"
     ],
     "deny": [],
     "ask": []
