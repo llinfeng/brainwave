@@ -483,16 +483,10 @@ async def websocket_endpoint(websocket: WebSocket):
             client.register_handler("input_audio_buffer.cleared", lambda data: handle_generic_event("input_audio_buffer.cleared", data))
             client.register_handler("input_audio_buffer.speech_started", lambda data: handle_generic_event("input_audio_buffer.speech_started", data))
             client.register_handler("rate_limits.updated", lambda data: handle_generic_event("rate_limits.updated", data))
-            client.register_handler("response.output_item.added", lambda data: handle_generic_event("response.output_item.added", data))
             client.register_handler("conversation.item.created", lambda data: handle_generic_event("conversation.item.created", data))
-            client.register_handler("response.content_part.added", lambda data: handle_generic_event("response.content_part.added", data))
-            client.register_handler("response.output_text.done", lambda data: handle_generic_event("response.output_text.done", data))
-            client.register_handler("response.content_part.done", lambda data: handle_generic_event("response.content_part.done", data))
-            client.register_handler("response.output_item.done", lambda data: handle_generic_event("response.output_item.done", data))
-            client.register_handler("response.done", lambda data: handle_response_done(data))
             client.register_handler("error", lambda data: handle_error(data))
-            client.register_handler("response.output_text.delta", lambda data: handle_text_delta(data))
-            client.register_handler("response.created", lambda data: handle_response_created(data))
+            client.register_handler("conversation.item.input_audio_transcription.delta", lambda data: handle_transcription_delta(data))
+            client.register_handler("conversation.item.input_audio_transcription.completed", lambda data: handle_transcription_completed(data))
             client.register_handler("conversation.item.input_audio_transcription.failed", lambda data: handle_transcription_failed(data))
 
             openai_ready.set()  # Set ready flag after successful initialization
@@ -517,33 +511,31 @@ async def websocket_endpoint(websocket: WebSocket):
             }))
             return False
 
-    # Move the handler definitions here (before initialize_openai)
-    async def handle_text_delta(data):
-        try:
-            if websocket.client_state == WebSocketState.CONNECTED:
-                text_delta = data.get("delta", "")
-                logger.info(f"Received text delta: '{text_delta}'")
-                cleaned_text = audio_processor.add_transcription_text(text_delta)
-                logger.info(f"Current transcription length: {len(''.join(audio_processor.current_transcription))}")
-                if cleaned_text:
-                    await websocket.send_text(json.dumps({
-                        "type": "text",
-                        "content": cleaned_text,
-                        "isNewResponse": False
-                    }))
-                    logger.info("Handled response.text.delta")
-                else:
-                    logger.debug("Filtered transcript header chunk from response stream")
-        except Exception as e:
-            logger.error(f"Error in handle_text_delta: {str(e)}", exc_info=True)
+    async def handle_transcription_delta(data):
+        logger.debug(f"Transcription delta: '{data.get('delta', '')}'")
 
-    async def handle_response_created(data):
-        await websocket.send_text(json.dumps({
-            "type": "text",
-            "content": "",
-            "isNewResponse": True
-        }))
-        logger.info("Handled response.created")
+    async def handle_transcription_completed(data):
+        raw_transcript = (data.get("transcript") or "").strip()
+        logger.info(f"Transcription completed, raw length: {len(raw_transcript)}")
+        if raw_transcript:
+            try:
+                fixed = await asyncio.to_thread(
+                    llm_processor.process_text_sync,
+                    raw_transcript,
+                    PROMPTS['grammar-fix'],
+                    "gpt-4o-mini"
+                )
+            except Exception as e:
+                logger.error(f"Grammar fix failed: {e}, using raw transcript")
+                fixed = raw_transcript
+            audio_processor.current_transcription = [fixed]
+            if websocket.client_state == WebSocketState.CONNECTED:
+                await websocket.send_text(json.dumps({
+                    "type": "text",
+                    "content": fixed,
+                    "isNewResponse": False
+                }))
+        await finalize_recording(success=bool(raw_transcript), reason="transcription_completed")
 
     async def handle_error(data):
         error_obj = data.get("error", {})
@@ -597,10 +589,6 @@ async def websocket_endpoint(websocket: WebSocket):
             logger.error(f"Failed to notify client about transcription failure: {e}", exc_info=True)
 
         await finalize_recording(success=False, reason="transcription_failed")
-
-    async def handle_response_done(data):
-        logger.info("Handled response.done")
-        await finalize_recording(success=True, reason="response_done")
 
     async def handle_generic_event(event_type, data):
         logger.info(f"Handled {event_type} with data: {json.dumps(data, ensure_ascii=False)}")
@@ -859,18 +847,15 @@ async def websocket_endpoint(websocket: WebSocket):
 
                                 logger.info("All audio sent, committing audio buffer...")
                                 try:
-                                    # Timeout protection around network calls so we can fall back if OpenAI is unreachable
                                     await asyncio.wait_for(client.commit_audio(), timeout=5.0)
-
-                                    # Debug: log the prompt being sent
-                                    prompt_text = PROMPTS['paraphrase-gpt-realtime']
-                                    logger.info(f"Sending prompt to realtime API: {prompt_text[:200]}...")
-                                    await asyncio.wait_for(client.start_response(prompt_text), timeout=5.0)
+                                    await websocket.send_text(json.dumps({
+                                        "type": "text", "content": "", "isNewResponse": True
+                                    }))
                                     try:
-                                        await asyncio.wait_for(recording_stopped.wait(), timeout=15.0)
+                                        await asyncio.wait_for(recording_stopped.wait(), timeout=30.0)
                                     except asyncio.TimeoutError:
-                                        logger.warning("Timeout waiting for OpenAI response completion; finalizing with fail-safe save")
-                                        await finalize_recording(success=False, reason="response_timeout")
+                                        logger.warning("Timeout waiting for transcription completion; finalizing with fail-safe save")
+                                        await finalize_recording(success=False, reason="transcription_timeout")
                                         continue
                                     # Don't close the client here, let the disconnect timer handle it
                                     # Update client status to connected (waiting for response)
@@ -1049,51 +1034,47 @@ async def upload_wav(file: UploadFile = File(...)):
                 # Convert back to bytes
                 processed_audio = audio_data.tobytes()
                 
-            # Initialize OpenAI Realtime client
+            # Initialize OpenAI Realtime client (transcription session)
             client = OpenAIRealtimeAudioTextClient(OPENAI_API_KEY)
             await client.connect()
-            
-            # Collect response text
-            response_text = []
-            response_complete = asyncio.Event()
-            
-            async def handle_text_delta(data):
-                text_delta = data.get("delta", "")
-                if text_delta:
-                    response_text.append(text_delta)
-            
-            async def handle_response_done(data):
-                response_complete.set()
-            
-            # Register handlers
-            client.register_handler("response.output_text.delta", handle_text_delta)
-            client.register_handler("response.done", handle_response_done)
-            
-            # Send the audio data in chunks (like realtime recording)
-            chunk_size = 4096  # Same as realtime recording
+
+            whisper_chunks: list[str] = []
+            transcript_complete = asyncio.Event()
+
+            async def wav_handle_delta(data):
+                delta = data.get("delta", "")
+                if delta:
+                    whisper_chunks.append(delta)
+
+            async def wav_handle_completed(data):
+                full = data.get("transcript", "")
+                if full:
+                    whisper_chunks.clear()
+                    whisper_chunks.append(full)
+                transcript_complete.set()
+
+            client.register_handler("conversation.item.input_audio_transcription.delta", wav_handle_delta)
+            client.register_handler("conversation.item.input_audio_transcription.completed", wav_handle_completed)
+
+            # Send audio in chunks
+            chunk_size = 4096
             for i in range(0, len(processed_audio), chunk_size):
-                chunk = processed_audio[i:i + chunk_size]
-                await client.send_audio(chunk)
-                # Small delay to simulate realtime
+                await client.send_audio(processed_audio[i:i + chunk_size])
                 await asyncio.sleep(0.01)
-            
-            # Commit the audio and start response with the same prompt
+
             await client.commit_audio()
-            
-            # Debug: log the prompt being sent
-            prompt_text = PROMPTS['paraphrase-gpt-realtime']
-            logger.info(f"WAV Upload - Sending prompt to realtime API: {prompt_text[:200]}...")
-            await client.start_response(prompt_text)
-            
-            # Wait for response completion
-            await response_complete.wait()
-            
-            # Clean up
+            await asyncio.wait_for(transcript_complete.wait(), timeout=30.0)
             await client.close()
-            
-            # Return the collected response
-            full_response = ''.join(response_text)
-            full_response = AudioProcessor.strip_transcript_header(full_response)
+
+            raw_transcript = whisper_chunks[0] if whisper_chunks else ""
+            logger.info(f"WAV Upload - whisper transcript length: {len(raw_transcript)}")
+
+            full_response = await asyncio.to_thread(
+                llm_processor.process_text_sync,
+                raw_transcript,
+                PROMPTS['grammar-fix'],
+                "gpt-4o-mini"
+            )
             logger.info(f"Successfully processed WAV file with Realtime API: {file.filename}")
             logger.info(f"Response length: {len(full_response)} characters")
             
