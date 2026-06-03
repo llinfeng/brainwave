@@ -494,12 +494,12 @@ async def websocket_endpoint(websocket: WebSocket):
             client.register_handler("response.output_item.added", lambda data: handle_generic_event("response.output_item.added", data))
             client.register_handler("conversation.item.created", lambda data: handle_generic_event("conversation.item.created", data))
             client.register_handler("response.content_part.added", lambda data: handle_generic_event("response.content_part.added", data))
-            client.register_handler("response.text.done", lambda data: handle_generic_event("response.text.done", data))
+            client.register_handler("response.output_text.done", lambda data: handle_generic_event("response.output_text.done", data))
             client.register_handler("response.content_part.done", lambda data: handle_generic_event("response.content_part.done", data))
             client.register_handler("response.output_item.done", lambda data: handle_generic_event("response.output_item.done", data))
             client.register_handler("response.done", lambda data: handle_response_done(data))
             client.register_handler("error", lambda data: handle_error(data))
-            client.register_handler("response.text.delta", lambda data: handle_text_delta(data))
+            client.register_handler("response.output_text.delta", lambda data: handle_text_delta(data))
             client.register_handler("response.created", lambda data: handle_response_created(data))
             client.register_handler("conversation.item.input_audio_transcription.failed", lambda data: handle_transcription_failed(data))
 
@@ -1074,7 +1074,7 @@ async def upload_wav(file: UploadFile = File(...)):
                 response_complete.set()
             
             # Register handlers
-            client.register_handler("response.text.delta", handle_text_delta)
+            client.register_handler("response.output_text.delta", handle_text_delta)
             client.register_handler("response.done", handle_response_done)
             
             # Send the audio data in chunks (like realtime recording)

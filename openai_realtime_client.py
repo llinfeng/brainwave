@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 class OpenAIRealtimeAudioTextClient:
-    def __init__(self, api_key: str, model: str = "gpt-realtime"):
+    def __init__(self, api_key: str, model: str = "gpt-realtime-1.5"):
         self.api_key = api_key
         self.model = model
         self.ws = None
@@ -44,7 +44,6 @@ class OpenAIRealtimeAudioTextClient:
                     proxy=proxy,
                     extra_headers={
                         "Authorization": f"Bearer {self.api_key}",
-                        "OpenAI-Beta": "realtime=v1"
                     }
                 )
                 self.ws = await proxy_connector
@@ -54,7 +53,6 @@ class OpenAIRealtimeAudioTextClient:
                     f"{self.base_url}?model={self.model}",
                     extra_headers={
                         "Authorization": f"Bearer {self.api_key}",
-                        "OpenAI-Beta": "realtime=v1"
                     }
                 )
         else:
@@ -62,7 +60,6 @@ class OpenAIRealtimeAudioTextClient:
                 f"{self.base_url}?model={self.model}",
                 extra_headers={
                     "Authorization": f"Bearer {self.api_key}",
-                    "OpenAI-Beta": "realtime=v1"
                 }
             )
         
@@ -77,12 +74,17 @@ class OpenAIRealtimeAudioTextClient:
             await self.ws.send(json.dumps({
                 "type": "session.update",
                 "session": {
-                    "modalities": modalities,
-                    "input_audio_format": "pcm16",
-                    "input_audio_transcription": {
-                        "model": "whisper-1"
+                    "type": "realtime",
+                    "output_modalities": modalities,
+                    "audio": {
+                        "input": {
+                            "format": {
+                                "type": "audio/pcm",
+                                "rate": 24000
+                            },
+                            "turn_detection": None,
+                        }
                     },
-                    "turn_detection": None,
                 }
             }))
         
@@ -149,7 +151,7 @@ class OpenAIRealtimeAudioTextClient:
             await self.ws.send(json.dumps({
                 "type": "response.create",
                 "response": {
-                    "modalities": ["text"],
+                    "output_modalities": ["text"],
                     "instructions": instructions
                 }
             }))
