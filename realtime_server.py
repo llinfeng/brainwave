@@ -176,48 +176,40 @@ class AudioProcessor:
 
     @staticmethod
     def strip_transcript_header(text: str) -> str:
-        """Remove the fixed header line from a full transcript string."""
-        header_line = "下面是语音识别转录结果："
-        if text.startswith(header_line):
-            remainder = text[len(header_line):]
-            return remainder.lstrip("\r\n")
+        """Remove preamble line (contains 转录结果) and the blank line after it."""
+        lines = text.split('\n')
+        if lines and "转录结果" in lines[0]:
+            rest = '\n'.join(lines[1:])
+            return rest.lstrip('\r\n')
         return text
 
     def _strip_transcript_header(self, text: str) -> str:
-        """Remove the fixed header line from the streaming transcript output."""
+        """Buffer until first non-empty line; discard it if it contains 转录结果, then strip leading blank lines."""
         if self._header_removed:
             return text
 
         combined = f"{self._header_buffer}{text}"
-        header = self._expected_header
-        header_line = self._transcript_header_line
+        # Skip any leading blank lines before checking the first real line
+        stripped_start = combined.lstrip("\r\n")
 
-        if header.startswith(combined):
-            # Still collecting header characters
+        if not stripped_start:
             self._header_buffer = combined
-            if len(self._header_buffer) == len(header):
-                self._header_buffer = ""
-                self._header_removed = True
             return ""
 
-        if combined.startswith(header):
-            # Header fully matched; remove it and mark as removed
-            self._header_removed = True
-            self._header_buffer = ""
-            return combined[len(header):]
+        newline_pos = stripped_start.find('\n')
 
-        if combined.startswith(header_line):
-            # Header line present but whitespace differs; strip line and leading newlines
-            remainder = combined[len(header_line):].lstrip("\r\n")
-            self._header_removed = True
-            self._header_buffer = ""
-            return remainder
+        if newline_pos == -1:
+            self._header_buffer = combined
+            return ""
 
-        # Header missing or altered: release buffered text and stop filtering
+        first_line = stripped_start[:newline_pos]
+        rest = stripped_start[newline_pos + 1:]
         self._header_removed = True
-        buffered = self._header_buffer
         self._header_buffer = ""
-        return f"{buffered}{text}"
+
+        if "转录结果" in first_line:
+            return rest.lstrip("\r\n")
+        return stripped_start
 
     def generate_content_filename(self, text_content):
         """Generate a descriptive filename from transcribed text content, caching the result for reuse."""
@@ -613,7 +605,7 @@ async def websocket_endpoint(websocket: WebSocket):
     async def handle_generic_event(event_type, data):
         logger.info(f"Handled {event_type} with data: {json.dumps(data, ensure_ascii=False)}")
 
-    async def finalize_recording(success=False, reason=""):
+    async def finalize_recording(success=False, reason="", notify_client=True):
         nonlocal client, pending_audio_chunks, pending_audio_operations, restful_audio_buffer
 
         async with finalize_lock:
@@ -654,7 +646,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
             openai_ready.clear()
 
-            if websocket.client_state == WebSocketState.CONNECTED:
+            if notify_client and websocket.client_state == WebSocketState.CONNECTED:
                 for payload in (
                     {"type": "status", "status": "idle"},
                     {"type": "cleanup_audio"},
@@ -731,7 +723,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         if msg.get("type") == "start_recording":
                             if audio_processor.has_active_session():
                                 logger.warning("Start recording requested while a session is active. Finalizing previous session first.")
-                                await finalize_recording(success=False, reason="duplicate_start")
+                                await finalize_recording(success=False, reason="duplicate_start", notify_client=False)
 
                             # Get sample rate from browser (default to 48000 if not provided)
                             source_sample_rate = msg.get("sample_rate", 48000)
