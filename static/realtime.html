@@ -18,17 +18,17 @@
         </div>
         
         <div class="mode-toggle-container">
-            <div class="tooltip-container"><a href="https://platform.openai.com/docs/guides/realtime" target="_blank" class="mode-label">Realtime</a><span class="tooltip-text">OpenAI Realtime API. Streams audio live as you speak. Lowest latency. Click for details.</span></div>
-            <label class="mode-toggle">
-                <input type="checkbox" id="modeToggle">
-                <span class="mode-slider"></span>
-            </label>
-            <div class="tooltip-container"><a href="https://platform.openai.com/docs/guides/speech-to-text" target="_blank" class="mode-label">RESTful</a><span class="tooltip-text">OpenAI Speech-to-Text API. Buffers audio, transcribes on stop. Better accuracy. Click for details.</span></div>
+            <label class="mode-label" for="modelSelect">Backend:</label>
+            <select id="modelSelect" class="model-select">
+                <option value="realtime">gpt-realtime-1.5 (Realtime) — ~6¢/min</option>
+                <option value="restful">gpt-4o-mini-transcribe (REST) — ~0.3¢/min</option>
+                <option value="audio15">gpt-audio-1.5 (Chat) — ~1.5¢/min</option>
+            </select>
         </div>
         <div class="record-button-container">
-<div class="tooltip-container"><button id="uploadButton" class="upload-button">Upload (Realtime)</button><span class="tooltip-text">Replicates live recording via Realtime API. Uses whisper-1 model internally.</span></div>
+<div class="tooltip-container"><button id="uploadButton" class="upload-button">Upload (Realtime)</button><span class="tooltip-text">Replicates live recording via Realtime API. Model: gpt-realtime-1.5.<span class="tooltip-price">~6.0 ¢/min</span></span></div>
             <button id="recordButton">Start</button>
-<div class="tooltip-container"><button id="whisperUploadButton" class="upload-button">Upload (RESTful)</button><span class="tooltip-text">Transcribes via REST API (/v1/audio/transcriptions) using whisper-1 model. Literal transcription.</span></div>
+<div class="tooltip-container"><button id="whisperUploadButton" class="upload-button">Upload (RESTful)</button><span class="tooltip-text">Transcribes via REST API (/v1/audio/transcriptions). Model: whisper-1. File upload only — not for live recording.<span class="tooltip-price">~0.6 ¢/min</span></span></div>
             <input type="file" id="fileInput" accept=".wav" style="display: none;">
             <input type="file" id="whisperFileInput" accept=".wav" style="display: none;">
         </div>

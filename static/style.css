@@ -1,4 +1,4 @@
-.tooltip-container{position:relative;display:inline-block}.tooltip-text{visibility:hidden;width:max-content;max-width:280px;background-color:#007aff;color:#fff;text-align:center;border-radius:6px;padding:8px;position:absolute;z-index:1;bottom:125%;left:50%;transform:translateX(-50%);opacity:0;transition:opacity .3s}.tooltip-text::after{content:"";position:absolute;top:100%;left:50%;margin-left:-5px;border-width:5px;border-style:solid;border-color:#007aff transparent transparent transparent}.tooltip-container:hover .tooltip-text{visibility:visible;opacity:1}
+.tooltip-container{position:relative;display:inline-block}.tooltip-text{visibility:hidden;width:max-content;max-width:280px;background-color:#007aff;color:#fff;text-align:center;border-radius:6px;padding:8px;position:absolute;z-index:1;bottom:125%;left:50%;transform:translateX(-50%);opacity:0;transition:opacity .3s}.tooltip-text::after{content:"";position:absolute;top:100%;left:50%;margin-left:-5px;border-width:5px;border-style:solid;border-color:#007aff transparent transparent transparent}.tooltip-container:hover .tooltip-text{visibility:visible;opacity:1}.tooltip-price{display:block;margin-top:6px;background-color:#ffb300;color:#1a1a1a;border-radius:10px;padding:2px 10px;font-size:0.82em;font-weight:700;letter-spacing:0.03em}
 
 body {
     font-family: system-ui, -apple-system, sans-serif;
@@ -433,4 +433,33 @@ body.dark-theme .mode-slider {
 
 body.dark-theme .mode-toggle input:checked + .mode-slider {
     background-color: #007AFF;
+}
+
+/* Model select dropdown */
+.model-select {
+    font-size: 0.875rem;
+    font-weight: 500;
+    padding: 5px 10px;
+    border-radius: 8px;
+    border: 1.5px solid #007AFF;
+    background-color: #fff;
+    color: #007AFF;
+    cursor: pointer;
+    outline: none;
+    transition: border-color 0.2s, background-color 0.2s;
+}
+
+.model-select:focus {
+    border-color: #0051CC;
+}
+
+body.dark-theme .model-select {
+    background-color: #1C1C1E;
+    color: #34C759;
+    border-color: #34C759;
+}
+
+body.dark-theme .model-select option {
+    background-color: #1C1C1E;
+    color: #E5E5EA;
 }

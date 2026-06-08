@@ -9,7 +9,7 @@ let streamInitialized = false;
 let isAutoStarted = false;
 
 // Transcription mode: 'realtime' or 'restful'
-let transcriptionMode = localStorage.getItem('transcriptionMode') || 'realtime';
+let transcriptionMode = 'restful';
 
 // Soundwave visualization
 let soundwaveCanvas, soundwaveCtx;
@@ -105,7 +105,7 @@ const copyEnhancedButton = document.getElementById('copyEnhancedButton');
 const readabilityButton = document.getElementById('readabilityButton');
 const askAIButton = document.getElementById('askAIButton');
 const correctnessButton = document.getElementById('correctnessButton');
-const modeToggle = document.getElementById('modeToggle');
+const modelSelect = document.getElementById('modelSelect');
 
 // Configuration
 const targetSeconds = 5;
@@ -843,28 +843,15 @@ function initializeTheme() {
     }
 }
 
-// Mode toggle handling
-function updateModeLabels() {
-    const labels = document.querySelectorAll('.mode-label');
-    if (labels.length >= 2) {
-        labels[0].classList.toggle('active', transcriptionMode === 'realtime');
-        labels[1].classList.toggle('active', transcriptionMode === 'restful');
-    }
-}
-
-function toggleTranscriptionMode() {
-    transcriptionMode = modeToggle.checked ? 'restful' : 'realtime';
-    localStorage.setItem('transcriptionMode', transcriptionMode);
-    updateModeLabels();
-    console.log('Transcription mode changed to:', transcriptionMode);
-}
-
+// Model select handling
 function initializeTranscriptionMode() {
-    // Set toggle state from saved preference
-    modeToggle.checked = transcriptionMode === 'restful';
-    updateModeLabels();
+    modelSelect.value = transcriptionMode;
 }
+
+modelSelect.onchange = () => {
+    transcriptionMode = modelSelect.value;
+    console.log('Transcription mode changed to:', transcriptionMode);
+};
 
 // Add to your existing event listeners
 document.getElementById('themeToggle').onclick = toggleTheme;
-modeToggle.onchange = toggleTranscriptionMode;
