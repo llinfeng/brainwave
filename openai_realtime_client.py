@@ -34,12 +34,12 @@ class OpenAIRealtimeAudioTextClient:
             if parsed.scheme == 'socks5':
                 from python_socks.async_.asyncio import Proxy
                 proxy = Proxy.from_url(proxy_url)
-                self.ws = await websockets_proxy.proxy_connect(url, proxy=proxy, extra_headers=headers)
+                self.ws = await websockets_proxy.proxy_connect(url, proxy=proxy, extra_headers=headers, open_timeout=15)
             else:
                 logger.warning(f"Unsupported proxy scheme: {parsed.scheme}, falling back to direct connection")
-                self.ws = await websockets.connect(url, extra_headers=headers)
+                self.ws = await websockets.connect(url, extra_headers=headers, open_timeout=15)
         else:
-            self.ws = await websockets.connect(url, extra_headers=headers)
+            self.ws = await websockets.connect(url, extra_headers=headers, open_timeout=15)
 
         # Wait for session creation
         response = await self.ws.recv()
