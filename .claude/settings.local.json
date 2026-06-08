@@ -17,7 +17,12 @@
       "Bash(git add:*)",
       "Bash(git commit:*)",
       "WebFetch(domain:developers.openai.com)",
-      "WebFetch(domain:openai.com)"
+      "WebFetch(domain:openai.com)",
+      "WebFetch(domain:github.com)",
+      "Bash(uv run *)",
+      "Bash(git -C /home/llinfeng/GitRepo/2_Area/brainwave status)",
+      "Bash(git -C /home/llinfeng/GitRepo/2_Area/brainwave diff)",
+      "Bash(git *)"
     ],
     "deny": [],
     "ask": []
