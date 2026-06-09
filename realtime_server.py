@@ -400,6 +400,8 @@ async def transcribe_with_rest_api(audio_data: bytes, websocket: WebSocket, audi
                 file=audio_file,
                 response_format="text",
                 stream=True,
+                language="zh",
+                prompt="以下是普通话录音，可能混有英语技术术语，包含项目规划、商业讨论等内容。",
             )
 
             full_text = ""
@@ -867,7 +869,24 @@ async def websocket_endpoint(websocket: WebSocket):
                                     }))
 
                                     try:
-                                        await transcribe_with_rest_api(combined_audio, websocket, audio_processor)
+                                        raw_text = await transcribe_with_rest_api(combined_audio, websocket, audio_processor)
+                                        if raw_text:
+                                            try:
+                                                fixed = await asyncio.to_thread(
+                                                    llm_processor.process_text_sync,
+                                                    raw_text,
+                                                    PROMPTS['grammar-fix'],
+                                                    "gpt-4o-mini"
+                                                )
+                                                audio_processor.current_transcription = [fixed]
+                                                if websocket.client_state == WebSocketState.CONNECTED:
+                                                    await websocket.send_text(json.dumps({
+                                                        "type": "text",
+                                                        "content": fixed,
+                                                        "isNewResponse": True
+                                                    }))
+                                            except Exception as gf_err:
+                                                logger.error(f"Grammar fix failed for restful mode: {gf_err}")
                                         await finalize_recording(success=True, reason="restful_complete")
                                     except Exception as e:
                                         logger.error(f"RESTful transcription failed: {e}", exc_info=True)
