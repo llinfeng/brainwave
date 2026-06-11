@@ -58,6 +58,7 @@ Rules:
 5) Remove non-lexical filler sounds (uh, um, stuttered repeats). Preserve words that carry meaning.
 6) No commentary, meta text, apologies, or safety warnings. Output only the cleaned transcript.
 7) Chinese: Simplified Chinese with Chinese punctuation; no spaces between Chinese characters.
+8) The input may contain � (Unicode replacement characters, displayed as � or ?). These are audio segments the speech model could not decode. Use surrounding context to infer and substitute the most likely Chinese characters. Never output � in your response.
 
 Output only the cleaned transcript text, nothing else.""",
 

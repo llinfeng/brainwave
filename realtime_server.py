@@ -876,7 +876,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                                     llm_processor.process_text_sync,
                                                     raw_text,
                                                     PROMPTS['grammar-fix'],
-                                                    "gpt-4o-mini"
+                                                    "gpt-4o"
                                                 )
                                                 audio_processor.current_transcription = [fixed]
                                                 if websocket.client_state == WebSocketState.CONNECTED:
