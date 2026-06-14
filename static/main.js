@@ -9,7 +9,7 @@ let streamInitialized = false;
 let isAutoStarted = false;
 
 // Transcription mode: 'realtime' or 'restful'
-let transcriptionMode = 'restful';
+let transcriptionMode = 'audio15';
 
 // Soundwave visualization
 let soundwaveCanvas, soundwaveCtx;
