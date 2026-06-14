@@ -378,7 +378,15 @@ class AudioProcessor:
                 logger.error(f"Failed to remove timestamp recording {timestamp_path}: {e}", exc_info=True)
 
 async def transcribe_with_rest_api(audio_data: bytes, websocket: WebSocket, audio_processor: AudioProcessor):
-    """Transcribe audio using REST API with SSE streaming using gpt-4o-mini-transcribe"""
+    """Transcribe audio via REST using gpt-4o-mini-transcribe (non-streaming).
+
+    We deliberately do NOT stream: streaming emits text token-by-token, and a
+    multi-byte UTF-8 character (e.g. Chinese, 3 bytes) split across two delta
+    chunks gets decoded as a U+FFFD replacement character. Non-streaming decodes
+    the whole response as one complete UTF-8 string, so the transcript is clean.
+    Restful mode is batch anyway (audio is buffered and sent only after Stop),
+    so streaming provided no real latency benefit.
+    """
     client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
     # Create temp file for audio (WAV format at 24kHz mono)
@@ -393,45 +401,28 @@ async def transcribe_with_rest_api(audio_data: bytes, websocket: WebSocket, audi
     try:
         logger.info(f"Calling REST API transcription with file: {tmp_path}")
 
-        # Call transcription API with streaming
         with open(tmp_path, 'rb') as audio_file:
-            stream = await client.audio.transcriptions.create(
+            response = await client.audio.transcriptions.create(
                 model="gpt-4o-mini-transcribe",
                 file=audio_file,
                 response_format="text",
-                stream=True,
                 language="zh",
                 prompt="以下是普通话录音，可能混有英语技术术语，包含项目规划、商业讨论等内容。",
             )
 
-            full_text = ""
-            async for event in stream:
-                if hasattr(event, 'type'):
-                    if event.type == "transcript.text.delta":
-                        delta = event.delta if hasattr(event, 'delta') else ""
-                        if delta:
-                            full_text += delta
-                            if websocket.client_state == WebSocketState.CONNECTED:
-                                await websocket.send_text(json.dumps({
-                                    "type": "text",
-                                    "content": delta,
-                                    "isNewResponse": False
-                                }))
-                    elif event.type == "transcript.text.done":
-                        logger.info(f"REST API transcription complete, length: {len(full_text)}")
-                elif hasattr(event, 'text'):
-                    # Fallback for non-streaming response format
-                    full_text = event.text
-                    if websocket.client_state == WebSocketState.CONNECTED:
-                        await websocket.send_text(json.dumps({
-                            "type": "text",
-                            "content": full_text,
-                            "isNewResponse": False
-                        }))
+        # response_format="text" returns the transcript string directly
+        full_text = (response if isinstance(response, str) else getattr(response, "text", "")).strip()
+        logger.info(f"REST API transcription complete, length: {len(full_text)}")
 
-            if full_text:
-                audio_processor.current_transcription = [full_text]
-            return full_text
+        if full_text:
+            audio_processor.current_transcription = [full_text]
+            if websocket.client_state == WebSocketState.CONNECTED:
+                await websocket.send_text(json.dumps({
+                    "type": "text",
+                    "content": full_text,
+                    "isNewResponse": False
+                }))
+        return full_text
 
     except Exception as e:
         logger.error(f"Error in REST API transcription: {e}", exc_info=True)
