@@ -474,6 +474,7 @@ async def transcribe_with_audio15(audio_data: bytes, websocket: WebSocket, audio
             transcript_text = (parsed.get("transcription") or "").strip() if isinstance(parsed, dict) else content
         except (json.JSONDecodeError, ValueError):
             transcript_text = content
+        transcript_text = AudioProcessor.strip_transcript_header(transcript_text)
         logger.info(f"gpt-audio-1.5 transcription complete, length: {len(transcript_text)}")
         if transcript_text:
             audio_processor.current_transcription = [transcript_text]

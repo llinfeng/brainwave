@@ -22,7 +22,10 @@
       "Bash(uv run *)",
       "Bash(git -C /home/llinfeng/GitRepo/2_Area/brainwave status)",
       "Bash(git -C /home/llinfeng/GitRepo/2_Area/brainwave diff)",
-      "Bash(git *)"
+      "Bash(git *)",
+      "Bash(pkill -f \"uvicorn realtime_server\")",
+      "Bash(.venv/bin/uvicorn realtime_server:app --host 0.0.0.0 --port 3402)",
+      "Bash(curl -s http://localhost:3402/ -o /dev/null -w \"%{http_code}\")"
     ],
     "deny": [],
     "ask": []
