@@ -3,6 +3,8 @@ let ws, audioContext, processor, source, stream, gainNode;
 let isRecording = false;
 let timerInterval;
 let startTime;
+let transcribeTimerInterval;
+let isTranscribing = false;
 let audioBuffer = new Int16Array(0);
 let wsConnected = false;
 let streamInitialized = false;
@@ -26,7 +28,10 @@ const WAVEFORM_BUFFER_SIZE = 2048; // Number of samples to display (adjust for s
 function updateHeading() {
     const heading = document.getElementById('statusHeading');
     console.log('updateHeading called, isRecording:', isRecording, 'streamInitialized:', streamInitialized, 'heading found:', !!heading);
-    
+
+    // While transcribing, the transcribe timer owns the heading — don't clobber it.
+    if (isTranscribing) return;
+
     if (heading) {
         let statusText;
         if (isRecording) {
@@ -224,6 +229,29 @@ function stopTimer() {
     clearInterval(timerInterval);
 }
 
+// "Transcribing… Ns" heading state, shown while we wait for the backend
+// (gpt-audio-1.5 can take ~1s per second of audio with no other feedback).
+function startTranscribingTimer() {
+    clearInterval(transcribeTimerInterval);
+    isTranscribing = true;
+    const start = Date.now();
+    const heading = document.getElementById('statusHeading');
+    const render = () => {
+        const secs = Math.floor((Date.now() - start) / 1000);
+        if (heading) heading.textContent = `transcribing… ${secs}s`;
+    };
+    render();
+    transcribeTimerInterval = setInterval(render, 1000);
+}
+
+function stopTranscribingTimer() {
+    if (!isTranscribing) return;
+    clearInterval(transcribeTimerInterval);
+    transcribeTimerInterval = null;
+    isTranscribing = false;
+    updateHeading();
+}
+
 // Audio cleanup function
 function cleanupAudioResources() {
     console.log("Cleaning up audio resources");
@@ -406,6 +434,7 @@ function initializeWebSocket() {
             case 'status':
                 updateConnectionStatus(data.status);
                 if (data.status === 'idle') {
+                    stopTranscribingTimer();
                     copyToClipboard(transcript.value, copyButton);
                 }
                 break;
@@ -416,9 +445,16 @@ function initializeWebSocket() {
                 } else {
                     transcript.value += data.content;
                 }
+                // First real transcript text means the backend answered — clear
+                // the "transcribing…" state. Empty pings (isNewResponse start
+                // signal) are ignored so the timer keeps running.
+                if (data.content && data.content.length > 0) {
+                    stopTranscribingTimer();
+                }
                 transcript.scrollTop = transcript.scrollHeight;
                 break;
             case 'error':
+                stopTranscribingTimer();
                 alert(data.content);
                 updateConnectionStatus('idle');
                 break;
@@ -433,6 +469,17 @@ function initializeWebSocket() {
     ws.onclose = () => {
         wsConnected = false;
         updateConnectionStatus(false);
+        // A dropped socket can never deliver the transcript / error / idle that
+        // ends a "transcribing…" state, nor carry an in-progress recording to
+        // the backend (a reconnect gets a fresh session). Treat the close as a
+        // terminal signal so the UI doesn't hang pretending work is happening.
+        const wasBusy = isTranscribing || isRecording;
+        stopTranscribingTimer();
+        if (isRecording) cleanupAudioResources();
+        if (wasBusy) {
+            const heading = document.getElementById('statusHeading');
+            if (heading) heading.textContent = 'connection lost — please retry';
+        }
         setTimeout(initializeWebSocket, 1000);
     };
 }
@@ -515,8 +562,11 @@ async function stopRecording() {
     
     await new Promise(resolve => setTimeout(resolve, 500));
     await ws.send(JSON.stringify({ type: 'stop_recording' }));
-    
+
     updateHeading();
+    // Backend now transcribes the buffered audio — show elapsed time so the
+    // wait doesn't look like a hang.
+    startTranscribingTimer();
 }
 
 // WAV file upload functionality
