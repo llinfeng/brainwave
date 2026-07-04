@@ -25,7 +25,13 @@
       "Bash(git *)",
       "Bash(pkill -f \"uvicorn realtime_server\")",
       "Bash(.venv/bin/uvicorn realtime_server:app --host 0.0.0.0 --port 3402)",
-      "Bash(curl -s http://localhost:3402/ -o /dev/null -w \"%{http_code}\")"
+      "Bash(curl -s http://localhost:3402/ -o /dev/null -w \"%{http_code}\")",
+      "Bash(ps -o pid,ppid,lstart,cmd -p 693636)",
+      "Bash(pstree -ps 693636)",
+      "Read(//home/llinfeng/NutstoreSync/Nutstore/Stable/AudioWrite/**)",
+      "Bash(ps -o lstart= -p 693636)",
+      "Bash(cd *)",
+      "Bash(node --check static/main.js)"
     ],
     "deny": [],
     "ask": []

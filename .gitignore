@@ -3,3 +3,4 @@ __pycache__*
 scratchpad.md
 .env
 venv/*
+realtime_server.log

@@ -8,6 +8,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse
 import uvicorn
 import logging
+from logging.handlers import RotatingFileHandler
 from prompts import PROMPTS
 from openai_realtime_client import OpenAIRealtimeAudioTextClient
 from starlette.websockets import WebSocketState
@@ -27,7 +28,16 @@ import tempfile
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        RotatingFileHandler(
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "realtime_server.log"),
+            maxBytes=5 * 1024 * 1024,
+            backupCount=3,
+            encoding="utf-8",
+        ),
+    ],
 )
 logger = logging.getLogger(__name__)
 
@@ -110,6 +120,7 @@ class AudioProcessor:
         self.saved_paths = {}
         self.latest_audio_path = None
         self.latest_transcription_path = None
+        self.transcription_model = None  # Which model produced current_transcription
 
     def process_audio_chunk(self, audio_data):
         # Convert binary audio data to Int16 array
@@ -146,6 +157,7 @@ class AudioProcessor:
         self.saved_paths = {}
         self.latest_audio_path = None
         self.latest_transcription_path = None
+        self.transcription_model = None
         return self.current_session_id
 
     def has_active_session(self):
@@ -162,6 +174,7 @@ class AudioProcessor:
         self.saved_paths = {}
         self.latest_audio_path = None
         self.latest_transcription_path = None
+        self.transcription_model = None
 
     def add_transcription_text(self, text):
         """Add transcription text to the current session"""
@@ -348,12 +361,15 @@ class AudioProcessor:
         logger.info(f"Saving transcription with filename: {filename}")
         logger.info(f"Full text path: {txt_path}")
 
+        model_note = f"\n\n---\n_Transcribed by: {self.transcription_model or 'unknown'}_\n"
         with open(txt_path, 'wb') as f:  # Open in binary mode
             # Write UTF-8 BOM
             f.write(b'\xef\xbb\xbf')
             # Write content encoded as UTF-8
             f.write(full_text.encode('utf-8'))
-        logger.info(f"Saved transcription to {txt_path} with UTF-8-BOM encoding")
+            # Footer noting which model produced the transcript
+            f.write(model_note.encode('utf-8'))
+        logger.info(f"Saved transcription to {txt_path} with UTF-8-BOM encoding (model: {self.transcription_model})")
         self.latest_transcription_path = txt_path
         return txt_path
 
@@ -416,6 +432,7 @@ async def transcribe_with_rest_api(audio_data: bytes, websocket: WebSocket, audi
 
         if full_text:
             audio_processor.current_transcription = [full_text]
+            audio_processor.transcription_model = "gpt-4o-mini-transcribe"
             if websocket.client_state == WebSocketState.CONNECTED:
                 await websocket.send_text(json.dumps({
                     "type": "text",
@@ -430,6 +447,27 @@ async def transcribe_with_rest_api(audio_data: bytes, websocket: WebSocket, audi
     finally:
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
+
+
+async def transcribe_wav_fallback(wav_path: str) -> str:
+    """Auto-recovery: transcribe an already-saved WAV via gpt-4o-transcribe.
+
+    Fires when the primary (live) transcription yields nothing — a parse miss,
+    an empty model reply, or a mid-recording WebSocket drop that only left a
+    fail-safe WAV on disk. This turns that WAV into a transcript automatically
+    so the user never has to re-upload it by hand. gpt-4o-transcribe (not
+    whisper-1) is used because it handles mixed Mandarin/English far better.
+    """
+    client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+    with open(wav_path, 'rb') as audio_file:
+        response = await client.audio.transcriptions.create(
+            model="gpt-4o-transcribe",
+            file=audio_file,
+            response_format="text",
+            language="zh",
+            prompt="以下是普通话录音，可能混有英语技术术语，包含项目规划、商业讨论等内容。",
+        )
+    return (response if isinstance(response, str) else getattr(response, "text", "")).strip()
 
 
 async def transcribe_with_audio15(audio_data: bytes, websocket: WebSocket, audio_processor: AudioProcessor):
@@ -468,16 +506,40 @@ async def transcribe_with_audio15(audio_data: bytes, websocket: WebSocket, audio
         )
 
         content = (response.choices[0].message.content or "").strip()
-        # Model sometimes returns JSON despite the prompt instructing plain text
+        finish_reason = response.choices[0].finish_reason
+        audio_seconds = len(audio_data) / 2 / 24000  # 16-bit mono @ 24kHz
+        # gpt-audio-1.5 often ignores the "plain text" instruction and wraps the
+        # transcript in JSON — and the key varies ("transcription", "message",
+        # "text", ...). Only checking "transcription" silently dropped complete
+        # transcripts keyed as "message". Pull out whatever string it used.
+        transcript_text = content
         try:
             parsed = json.loads(content)
-            transcript_text = (parsed.get("transcription") or "").strip() if isinstance(parsed, dict) else content
+            if isinstance(parsed, str):
+                transcript_text = parsed
+            elif isinstance(parsed, dict):
+                candidates = [parsed[k] for k in ("transcription", "message", "text", "content")
+                              if isinstance(parsed.get(k), str) and parsed[k].strip()]
+                if not candidates:
+                    candidates = [v for v in parsed.values() if isinstance(v, str) and v.strip()]
+                if candidates:
+                    transcript_text = candidates[0]
         except (json.JSONDecodeError, ValueError):
             transcript_text = content
-        transcript_text = AudioProcessor.strip_transcript_header(transcript_text)
-        logger.info(f"gpt-audio-1.5 transcription complete, length: {len(transcript_text)}")
+        transcript_text = AudioProcessor.strip_transcript_header(transcript_text.strip())
+        logger.info(
+            f"gpt-audio-1.5 transcription complete, length: {len(transcript_text)}, "
+            f"finish_reason: {finish_reason}, audio_seconds: {audio_seconds:.1f}"
+        )
+        if not transcript_text:
+            logger.warning(
+                f"gpt-audio-1.5 returned EMPTY transcript "
+                f"(finish_reason={finish_reason}, audio_seconds={audio_seconds:.1f}, "
+                f"raw_content={content!r}, usage={response.usage})"
+            )
         if transcript_text:
             audio_processor.current_transcription = [transcript_text]
+            audio_processor.transcription_model = "gpt-audio-1.5"
             if websocket.client_state == WebSocketState.CONNECTED:
                 await websocket.send_text(json.dumps({
                     "type": "text",
@@ -593,6 +655,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 logger.error(f"Grammar fix failed: {e}, using raw transcript")
                 fixed = raw_transcript
             audio_processor.current_transcription = [fixed]
+            audio_processor.transcription_model = "gpt-realtime (+ gpt-4o-mini grammar-fix)"
             if websocket.client_state == WebSocketState.CONNECTED:
                 await websocket.send_text(json.dumps({
                     "type": "text",
@@ -674,6 +737,48 @@ async def websocket_endpoint(websocket: WebSocket):
                     transcription_path = audio_processor.save_transcription()
                 except Exception as e:
                     logger.error(f"Failed to save transcription during finalize: {e}", exc_info=True)
+
+                # Auto-fallback: the live path produced no transcript (parse miss,
+                # empty model reply, or a mid-recording socket drop) but a WAV was
+                # saved. Recover it via gpt-4o-transcribe so a recording is never
+                # silently lost and the user never has to re-upload by hand.
+                if not transcription_path and audio_path and os.path.exists(audio_path):
+                    try:
+                        logger.info(f"No transcript from primary path; auto-fallback on {audio_path}")
+                        recovered = await transcribe_wav_fallback(audio_path)
+                        if recovered:
+                            audio_processor.current_transcription = [recovered]
+                            audio_processor.transcription_model = "gpt-4o-transcribe (auto-fallback)"
+                            audio_processor.current_filename = None  # regenerate a descriptive name
+                            transcription_path = audio_processor.save_transcription()
+                            # Rename the placeholder WAV (recording-too-short / timestamp) to match,
+                            # and drop any leftover fail-safe WAV, so we end with one clean pair.
+                            new_base = audio_processor.current_filename
+                            if new_base:
+                                new_wav = os.path.join(RECORDINGS_DIR, f"{new_base}.wav")
+                                if os.path.abspath(new_wav) != os.path.abspath(audio_path):
+                                    try:
+                                        os.replace(audio_path, new_wav)
+                                        audio_processor.saved_paths["content"] = new_wav
+                                        audio_path = new_wav
+                                    except OSError as rename_err:
+                                        logger.error(f"Failed to rename recovered WAV: {rename_err}")
+                            leftover = audio_processor.saved_paths.get("timestamp")
+                            if leftover and os.path.exists(leftover) and os.path.abspath(leftover) != os.path.abspath(audio_path):
+                                try:
+                                    os.remove(leftover)
+                                    audio_processor.saved_paths.pop("timestamp", None)
+                                except OSError as rm_err:
+                                    logger.error(f"Failed to remove leftover fail-safe WAV: {rm_err}")
+                            logger.info(f"Auto-fallback recovered {len(recovered)} chars -> {transcription_path}")
+                            if websocket.client_state == WebSocketState.CONNECTED:
+                                await websocket.send_text(json.dumps({
+                                    "type": "text", "content": recovered, "isNewResponse": True
+                                }))
+                        else:
+                            logger.warning("Auto-fallback transcription returned empty")
+                    except Exception as e:
+                        logger.error(f"Auto-fallback transcription failed: {e}", exc_info=True)
 
                 if success and audio_path and transcription_path:
                     audio_processor.cleanup_timestamp_backup()
@@ -1216,6 +1321,7 @@ async def upload_wav_whisper(file: UploadFile = File(...)):
             naming_processor.current_transcription = [transcript_text]
             naming_processor.current_filename = None
             naming_processor._header_removed = True
+            naming_processor.transcription_model = "whisper-1 (manual upload)"
 
             txt_path = None
             try:
