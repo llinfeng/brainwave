@@ -20,15 +20,14 @@
         <div class="mode-toggle-container">
             <label class="mode-label" for="modelSelect">Backend:</label>
             <select id="modelSelect" class="model-select">
-                <option value="audio15">gpt-audio-1.5 (Chat) — ~1.5¢/min</option>
-                <option value="realtime">gpt-realtime-1.5 (Realtime) — ~6¢/min</option>
-                <option value="restful">gpt-4o-mini-transcribe (REST) — ~0.3¢/min</option>
+                <option value="restful" style="color: #1a7f37;">🟢 gpt-4o-transcribe (REST) · 0.6¢/min&nbsp;&nbsp;&nbsp;&nbsp;faithful</option>
+                <option value="realtime" style="color: #d97706;">🟠 gpt-realtime-1.5 (Realtime) · 6¢/min&nbsp;&nbsp;&nbsp;&nbsp;fast</option>
             </select>
         </div>
         <div class="record-button-container">
-<div class="tooltip-container"><button id="uploadButton" class="upload-button">Upload (Realtime)</button><span class="tooltip-text">Replicates live recording via Realtime API. Model: gpt-realtime-1.5.<span class="tooltip-price">~6.0 ¢/min</span></span></div>
+<div class="tooltip-container"><button id="uploadButton" class="upload-button">Upload (Realtime)</button><span class="tooltip-text">Upload a WAV, replayed through the Realtime API. Model: gpt-realtime-1.5. Matches the Realtime dropdown option.<span class="tooltip-price">~6.0 ¢/min</span></span></div>
             <button id="recordButton">Start</button>
-<div class="tooltip-container"><button id="whisperUploadButton" class="upload-button">Upload (RESTful)</button><span class="tooltip-text">Transcribes via REST API (/v1/audio/transcriptions). Model: whisper-1. File upload only — not for live recording.<span class="tooltip-price">~0.6 ¢/min</span></span></div>
+<div class="tooltip-container"><button id="whisperUploadButton" class="upload-button">Upload (Transcribe)</button><span class="tooltip-text">Upload a WAV, transcribed via REST (/v1/audio/transcriptions). Model: gpt-4o-transcribe. Matches the gpt-4o-transcribe dropdown option.<span class="tooltip-price">~0.6 ¢/min</span></span></div>
             <input type="file" id="fileInput" accept=".wav" style="display: none;">
             <input type="file" id="whisperFileInput" accept=".wav" style="display: none;">
         </div>

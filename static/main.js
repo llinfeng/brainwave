@@ -11,7 +11,7 @@ let streamInitialized = false;
 let isAutoStarted = false;
 
 // Transcription mode: 'realtime' or 'restful'
-let transcriptionMode = 'audio15';
+let transcriptionMode = 'restful';
 
 // Soundwave visualization
 let soundwaveCanvas, soundwaveCtx;
@@ -643,7 +643,7 @@ fileInput.onchange = async (event) => {
     }
 };
 
-// Whisper WAV file upload functionality
+// gpt-4o-transcribe WAV file upload functionality
 whisperUploadButton.onclick = () => {
     whisperFileInput.click();
 };
@@ -671,7 +671,7 @@ whisperFileInput.onchange = async (event) => {
         const formData = new FormData();
         formData.append('file', file);
         
-        const response = await fetch('/api/v1/upload_wav_whisper', {
+        const response = await fetch('/api/v1/upload_wav_transcribe', {
             method: 'POST',
             body: formData
         });
@@ -703,13 +703,13 @@ whisperFileInput.onchange = async (event) => {
         if (timerStarted) stopTimer();
         
     } catch (error) {
-        console.error('Error uploading WAV file to Whisper:', error);
-        alert('Error processing WAV file with Whisper: ' + error.message);
+        console.error('Error uploading WAV file to gpt-4o-transcribe:', error);
+        alert('Error processing WAV file with gpt-4o-transcribe: ' + error.message);
         // Only stop timer if it was started
         if (timerStarted) stopTimer();
     } finally {
         // Reset button to original text
-        whisperUploadButton.textContent = 'Upload (Whisper)';
+        whisperUploadButton.textContent = 'Upload (Transcribe)';
         whisperUploadButton.disabled = false;
         // Clear file input
         whisperFileInput.value = '';

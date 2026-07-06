@@ -393,8 +393,18 @@ class AudioProcessor:
             except Exception as e:
                 logger.error(f"Failed to remove timestamp recording {timestamp_path}: {e}", exc_info=True)
 
+# Shared vocabulary hint for the transcription endpoint. Deliberately does NOT
+# pin a language: the user speaks English, Mandarin, or a code-switched mix, so
+# we let gpt-4o-transcribe auto-detect and keep each language as spoken.
+TRANSCRIBE_HINT = (
+    "Mandarin and/or English speech, possibly code-switched, may include "
+    "technical terms and product names (e.g., LLM, GPT, agent, DB, Cursor). "
+    "Transcribe verbatim in the original language(s); do not translate."
+)
+
+
 async def transcribe_with_rest_api(audio_data: bytes, websocket: WebSocket, audio_processor: AudioProcessor):
-    """Transcribe audio via REST using gpt-4o-mini-transcribe (non-streaming).
+    """Transcribe audio via REST using gpt-4o-transcribe (non-streaming).
 
     We deliberately do NOT stream: streaming emits text token-by-token, and a
     multi-byte UTF-8 character (e.g. Chinese, 3 bytes) split across two delta
@@ -419,11 +429,10 @@ async def transcribe_with_rest_api(audio_data: bytes, websocket: WebSocket, audi
 
         with open(tmp_path, 'rb') as audio_file:
             response = await client.audio.transcriptions.create(
-                model="gpt-4o-mini-transcribe",
+                model="gpt-4o-transcribe",
                 file=audio_file,
                 response_format="text",
-                language="zh",
-                prompt="以下是普通话录音，可能混有英语技术术语，包含项目规划、商业讨论等内容。",
+                prompt=TRANSCRIBE_HINT,
             )
 
         # response_format="text" returns the transcript string directly
@@ -432,7 +441,7 @@ async def transcribe_with_rest_api(audio_data: bytes, websocket: WebSocket, audi
 
         if full_text:
             audio_processor.current_transcription = [full_text]
-            audio_processor.transcription_model = "gpt-4o-mini-transcribe"
+            audio_processor.transcription_model = "gpt-4o-transcribe"
             if websocket.client_state == WebSocketState.CONNECTED:
                 await websocket.send_text(json.dumps({
                     "type": "text",
@@ -464,8 +473,7 @@ async def transcribe_wav_fallback(wav_path: str) -> str:
             model="gpt-4o-transcribe",
             file=audio_file,
             response_format="text",
-            language="zh",
-            prompt="以下是普通话录音，可能混有英语技术术语，包含项目规划、商业讨论等内容。",
+            prompt=TRANSCRIBE_HINT,
         )
     return (response if isinstance(response, str) else getattr(response, "text", "")).strip()
 
@@ -1251,10 +1259,29 @@ async def upload_wav(file: UploadFile = File(...)):
             )
             logger.info(f"Successfully processed WAV file with Realtime API: {file.filename}")
             logger.info(f"Response length: {len(full_response)} characters")
-            
+
+            # Persist the transcript to a .txt so the Realtime upload matches the
+            # Transcribe upload (which saves a file). Uses the timestamp embedded
+            # in the uploaded filename; save_transcription generates a fresh
+            # descriptive name from the content.
+            transcript_text = full_response.strip()
+            if transcript_text:
+                session_id = extract_time_tag_from_filename(file.filename)
+                naming_processor = AudioProcessor()
+                naming_processor.current_session_id = session_id
+                naming_processor.current_transcription = [transcript_text]
+                naming_processor.current_filename = None
+                naming_processor._header_removed = True
+                naming_processor.transcription_model = "gpt-realtime (+ gpt-4o-mini grammar-fix, manual upload)"
+                try:
+                    saved_txt = naming_processor.save_transcription()
+                    logger.info(f"Saved Realtime upload transcription to {saved_txt}")
+                except Exception as save_error:
+                    logger.error(f"Failed to save Realtime upload transcription for {session_id}: {save_error}", exc_info=True)
+
             async def text_generator():
                 yield full_response
-            
+
             return StreamingResponse(text_generator(), media_type="text/plain")
             
         finally:
@@ -1279,21 +1306,21 @@ async def upload_wav(file: UploadFile = File(...)):
         raise HTTPException(status_code=status_code, detail=error_msg)
 
 @app.post(
-    "/api/v1/upload_wav_whisper",
-    summary="Upload WAV file for Whisper transcription",
-    description="Upload a WAV file to be transcribed using OpenAI Whisper API for literal transcription."
+    "/api/v1/upload_wav_transcribe",
+    summary="Upload WAV file for gpt-4o-transcribe transcription",
+    description="Upload a WAV file to be transcribed via the REST transcription API using gpt-4o-transcribe."
 )
-async def upload_wav_whisper(file: UploadFile = File(...)):
+async def upload_wav_transcribe(file: UploadFile = File(...)):
     if not file.filename.lower().endswith('.wav'):
         raise HTTPException(status_code=400, detail="Only WAV files are supported.")
-    
+
     try:
-        logger.info(f"Processing uploaded WAV file with Whisper: {file.filename}")
-        
+        logger.info(f"Processing uploaded WAV file with gpt-4o-transcribe: {file.filename}")
+
         # Read the uploaded file
         file_content = await file.read()
-        
-        # Initialize OpenAI client for Whisper
+
+        # Initialize OpenAI client
         client = AsyncOpenAI(api_key=OPENAI_API_KEY)
         
         # Create a temporary file for the audio
@@ -1302,15 +1329,16 @@ async def upload_wav_whisper(file: UploadFile = File(...)):
             tmp_file_path = tmp_file.name
         
         try:
-            # Use OpenAI Whisper to transcribe the audio
+            # Transcribe via gpt-4o-transcribe (matches the 🟢 dropdown option).
             with open(tmp_file_path, 'rb') as audio_file:
                 transcript = await client.audio.transcriptions.create(
-                    model="whisper-1",
+                    model="gpt-4o-transcribe",
                     file=audio_file,
-                    response_format="text"
+                    response_format="text",
+                    prompt=TRANSCRIBE_HINT,
                 )
-            
-            logger.info(f"Successfully transcribed WAV file with Whisper: {file.filename}")
+
+            logger.info(f"Successfully transcribed WAV file with gpt-4o-transcribe: {file.filename}")
             logger.info(f"Transcription length: {len(transcript)} characters")
 
             # Persist transcription using the timestamp embedded in the filename (if present)
@@ -1321,18 +1349,18 @@ async def upload_wav_whisper(file: UploadFile = File(...)):
             naming_processor.current_transcription = [transcript_text]
             naming_processor.current_filename = None
             naming_processor._header_removed = True
-            naming_processor.transcription_model = "whisper-1 (manual upload)"
+            naming_processor.transcription_model = "gpt-4o-transcribe (manual upload)"
 
             txt_path = None
             try:
                 txt_path = naming_processor.save_transcription()
             except Exception as save_error:
-                logger.error(f"Failed to save Whisper transcription for {session_id}: {save_error}", exc_info=True)
+                logger.error(f"Failed to save gpt-4o-transcribe transcription for {session_id}: {save_error}", exc_info=True)
 
             if txt_path:
-                logger.info(f"Saved Whisper transcription to {txt_path}")
+                logger.info(f"Saved gpt-4o-transcribe transcription to {txt_path}")
             else:
-                logger.warning("Whisper transcription could not be saved; returning text response only.")
+                logger.warning("gpt-4o-transcribe transcription could not be saved; returning text response only.")
             
             # Return the transcription as a streaming response
             async def text_generator():
@@ -1346,7 +1374,7 @@ async def upload_wav_whisper(file: UploadFile = File(...)):
                 os.unlink(tmp_file_path)
     
     except Exception as e:
-        logger.error(f"Error processing WAV file with Whisper: {e}", exc_info=True)
+        logger.error(f"Error processing WAV file with gpt-4o-transcribe: {e}", exc_info=True)
         # Parse OpenAI-specific errors for better user feedback
         error_msg = str(e)
         status_code = 500
