@@ -95,6 +95,17 @@ if not OPENAI_API_KEY:
     logger.error("OPENAI_API_KEY is not set in environment variables.")
     raise EnvironmentError("OPENAI_API_KEY is not set.")
 
+# Xiaomi MiMo ASR (shadow testing). OpenAI-compatible API; docs:
+# https://mimo.mi.com/models/en-US/mimo-v2.5-asr
+# Optional: when the key is absent the shadow transcription is skipped silently.
+MIMO_API_KEY = os.getenv("MIMO_API_KEY") or os.getenv("XIAOMI_ASR_API_KEY")
+MIMO_BASE_URL = os.getenv("MIMO_BASE_URL", "https://api.xiaomimimo.com/v1")
+MIMO_ASR_MODEL = os.getenv("MIMO_ASR_MODEL", "mimo-v2.5-asr")
+if MIMO_API_KEY:
+    logger.info("MiMo ASR shadow transcription enabled")
+else:
+    logger.info("MIMO_API_KEY not set; MiMo ASR shadow transcription disabled")
+
 # Initialize with a default model
 llm_processor = get_llm_processor("gpt-4o")  # Default processor
 
@@ -396,6 +407,25 @@ class AudioProcessor:
 # Shared vocabulary hint for the transcription endpoint. Deliberately does NOT
 # pin a language: the user speaks English, Mandarin, or a code-switched mix, so
 # we let gpt-4o-transcribe auto-detect and keep each language as spoken.
+# Bad-roll detection for gpt-4o-transcribe. Thresholds calibrated on 332
+# historical AudioWrite clips >= 10s (see analysis_tmp/chars_per_sec.py):
+# English-only transcripts run ~10.8 chars/sec median (p10 = 7.2), while
+# mixed Chinese/English run ~3.6 (p10 = 2.1) because CJK packs a word per
+# character. So the plausibility floor depends on the script of the returned
+# text: below it, the model very likely dropped part of the audio. False
+# positives just cost one extra API call. Short clips are exempt — a 3s
+# "LLM" is legitimate.
+MIN_CHARS_PER_SEC_ENGLISH = 5.0
+MIN_CHARS_PER_SEC_CJK = 2.0
+MIN_RETRY_DURATION_SEC = 10.0
+_CJK_RE = re.compile(r'[一-鿿]')
+
+
+def min_plausible_transcript_chars(text: str, duration_sec: float) -> float:
+    """Minimum plausible transcript length for a clip, by script of `text`."""
+    rate = MIN_CHARS_PER_SEC_CJK if _CJK_RE.search(text) else MIN_CHARS_PER_SEC_ENGLISH
+    return duration_sec * rate
+
 TRANSCRIBE_HINT = (
     "Mandarin and/or English speech, possibly code-switched, may include "
     "technical terms and product names (e.g., LLM, GPT, agent, DB, Cursor). "
@@ -424,9 +454,14 @@ async def transcribe_with_rest_api(audio_data: bytes, websocket: WebSocket, audi
             wf.setframerate(24000)
             wf.writeframes(audio_data)
 
-    try:
-        logger.info(f"Calling REST API transcription with file: {tmp_path}")
+    # gpt-4o-transcribe occasionally returns only a fragment of a longer clip
+    # (nondeterministic; re-sending the identical audio usually recovers the
+    # full text). We know the clip duration from the PCM byte count, so a
+    # transcript far shorter than plausible speech density flags a bad roll:
+    # retry once (two tries total) and keep the longer transcript.
+    duration_sec = len(audio_data) / (24000 * 2)
 
+    async def _transcribe_once() -> str:
         with open(tmp_path, 'rb') as audio_file:
             response = await client.audio.transcriptions.create(
                 model="gpt-4o-transcribe",
@@ -434,10 +469,28 @@ async def transcribe_with_rest_api(audio_data: bytes, websocket: WebSocket, audi
                 response_format="text",
                 prompt=TRANSCRIBE_HINT,
             )
-
         # response_format="text" returns the transcript string directly
-        full_text = (response if isinstance(response, str) else getattr(response, "text", "")).strip()
+        return (response if isinstance(response, str) else getattr(response, "text", "")).strip()
+
+    try:
+        logger.info(f"Calling REST API transcription with file: {tmp_path} ({duration_sec:.1f}s)")
+
+        full_text = await _transcribe_once()
         logger.info(f"REST API transcription complete, length: {len(full_text)}")
+
+        min_plausible_chars = min_plausible_transcript_chars(full_text, duration_sec)
+        if duration_sec >= MIN_RETRY_DURATION_SEC and len(full_text) < min_plausible_chars:
+            logger.warning(
+                f"Transcript suspiciously short ({len(full_text)} chars for "
+                f"{duration_sec:.1f}s audio, expected >= {min_plausible_chars:.0f}); retrying once"
+            )
+            try:
+                retry_text = await _transcribe_once()
+                logger.info(f"Retry transcription complete, length: {len(retry_text)}")
+                if len(retry_text) > len(full_text):
+                    full_text = retry_text
+            except Exception as e:
+                logger.error(f"Retry transcription failed; keeping first result: {e}", exc_info=True)
 
         if full_text:
             audio_processor.current_transcription = [full_text]
@@ -456,6 +509,96 @@ async def transcribe_with_rest_api(audio_data: bytes, websocket: WebSocket, audi
     finally:
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
+
+
+def pcm_to_wav_bytes(pcm_audio: bytes, sample_rate: int = 24000) -> bytes:
+    """Wrap raw 16-bit mono PCM into an in-memory WAV container (no temp file)."""
+    buf = io.BytesIO()
+    with wave.open(buf, 'wb') as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm_audio)
+    return buf.getvalue()
+
+
+async def mimo_transcribe(wav_bytes: bytes) -> str:
+    """Transcribe WAV bytes with Xiaomi MiMo ASR; returns text ('' on empty/error).
+
+    MiMo exposes an OpenAI-compatible chat-completions API where the audio is
+    sent as base64 `input_audio` (docs: mimo.mi.com/models/en-US/mimo-v2.5-asr).
+    """
+    if not MIMO_API_KEY:
+        return ""
+    try:
+        audio_b64 = base64.b64encode(wav_bytes).decode('ascii')
+        client = AsyncOpenAI(api_key=MIMO_API_KEY, base_url=MIMO_BASE_URL)
+        response = await client.chat.completions.create(
+            model=MIMO_ASR_MODEL,
+            messages=[{
+                "role": "user",
+                "content": [{
+                    "type": "input_audio",
+                    "input_audio": {"data": audio_b64, "format": "wav"},
+                }],
+            }],
+            extra_body={"language": "auto"},
+        )
+        return (response.choices[0].message.content or "").strip()
+    except Exception as e:
+        logger.error(f"MiMo ASR shadow transcription failed: {e}", exc_info=True)
+        return ""
+
+
+async def mimo_transcribe_file(wav_path: str) -> str:
+    """MiMo transcription reading bytes from a saved WAV (fallback for modes
+    that don't keep a local PCM buffer, e.g. realtime)."""
+    try:
+        with open(wav_path, 'rb') as f:
+            return await mimo_transcribe(f.read())
+    except Exception as e:
+        logger.error(f"MiMo ASR shadow file read failed for {wav_path}: {e}", exc_info=True)
+        return ""
+
+
+def start_mimo_shadow(pcm_audio: bytes):
+    """Kick off MiMo transcription the moment audio is ready, in parallel with the
+    primary (OpenAI) call — Xiaomi usually finishes first on a slow OpenAI link.
+    Returns an asyncio Task yielding the transcript text, or None when disabled /
+    no audio. The file is written later (once the descriptive name exists)."""
+    if not MIMO_API_KEY or not pcm_audio:
+        return None
+    return asyncio.create_task(mimo_transcribe(pcm_to_wav_bytes(pcm_audio)))
+
+
+def write_mimo_shadow(text: str, reference_txt_path: str):
+    """Write the MiMo shadow transcript as `<base>_by_MiMoASR.txt`, next to the
+    primary transcript, using the (already renamed) descriptive filename."""
+    if not text:
+        logger.warning("MiMo ASR shadow produced no text; nothing written")
+        return
+    base, _ = os.path.splitext(reference_txt_path)
+    shadow_path = f"{base}_by_MiMoASR.txt"
+    model_note = f"\n\n---\n_Transcribed by: {MIMO_ASR_MODEL} (shadow)_\n"
+    try:
+        with open(shadow_path, 'wb') as f:
+            f.write(b'\xef\xbb\xbf')
+            f.write(text.encode('utf-8'))
+            f.write(model_note.encode('utf-8'))
+        logger.info(f"MiMo ASR shadow transcript saved to {shadow_path} ({len(text)} chars)")
+    except Exception as e:
+        logger.error(f"Failed to write MiMo shadow transcript to {shadow_path}: {e}", exc_info=True)
+
+
+async def _finish_mimo_shadow(task, reference_txt_path: str):
+    """Await the in-flight MiMo task (started in parallel with OpenAI) and write
+    its transcript once the descriptive filename is known."""
+    try:
+        text = await task
+    except Exception as e:
+        logger.error(f"MiMo ASR shadow await failed: {e}", exc_info=True)
+        return
+    write_mimo_shadow(text, reference_txt_path)
 
 
 async def transcribe_wav_fallback(wav_path: str) -> str:
@@ -585,6 +728,7 @@ async def websocket_endpoint(websocket: WebSocket):
     # Track transcription mode for current session
     current_mode = "realtime"  # Default mode
     restful_audio_buffer = []  # Buffer for RESTful mode audio
+    pending_mimo_task = None   # In-flight MiMo shadow transcription (started at stop)
 
     # Add synchronization for audio sending operations
     pending_audio_operations = 0
@@ -729,7 +873,7 @@ async def websocket_endpoint(websocket: WebSocket):
         logger.info(f"Handled {event_type} with data: {json.dumps(data, ensure_ascii=False)}")
 
     async def finalize_recording(success=False, reason="", notify_client=True):
-        nonlocal client, pending_audio_chunks, pending_audio_operations, restful_audio_buffer
+        nonlocal client, pending_audio_chunks, pending_audio_operations, restful_audio_buffer, pending_mimo_task
 
         async with finalize_lock:
             logger.info(f"Finalizing recording (success={success}, reason={reason})")
@@ -791,6 +935,23 @@ async def websocket_endpoint(websocket: WebSocket):
                 if success and audio_path and transcription_path:
                     audio_processor.cleanup_timestamp_backup()
 
+                # Shadow testing: MiMo was launched in parallel with the OpenAI
+                # call the moment audio was buffered (start_mimo_shadow), so it's
+                # usually already done by now. Write its sibling transcript using
+                # the descriptive name. Non-blocking so it never delays finalize.
+                reference = transcription_path or audio_path
+                if pending_mimo_task is not None:
+                    if reference:
+                        asyncio.create_task(_finish_mimo_shadow(pending_mimo_task, reference))
+                    else:
+                        pending_mimo_task.cancel()
+                    pending_mimo_task = None
+                elif MIMO_API_KEY and reference and audio_path and os.path.exists(audio_path):
+                    # Modes without a local PCM buffer (e.g. realtime): late shadow from the WAV.
+                    asyncio.create_task(
+                        _finish_mimo_shadow(asyncio.create_task(mimo_transcribe_file(audio_path)), reference)
+                    )
+
                 audio_processor.end_session()
             else:
                 logger.debug("No active session to finalize")
@@ -825,7 +986,7 @@ async def websocket_endpoint(websocket: WebSocket):
             logger.info("Finalize recording completed")
 
     async def receive_messages():
-        nonlocal client, current_mode, restful_audio_buffer, pending_audio_operations
+        nonlocal client, current_mode, restful_audio_buffer, pending_audio_operations, pending_mimo_task
 
         try:
             while True:
@@ -966,6 +1127,9 @@ async def websocket_endpoint(websocket: WebSocket):
                                     combined_audio = b''.join(restful_audio_buffer)
                                     logger.info(f"RESTful mode: Total audio size: {len(combined_audio)} bytes")
 
+                                    # Launch MiMo shadow now, in parallel with the (slower) OpenAI call.
+                                    pending_mimo_task = start_mimo_shadow(combined_audio)
+
                                     # Send new response indicator
                                     await websocket.send_text(json.dumps({
                                         "type": "text",
@@ -1008,6 +1172,9 @@ async def websocket_endpoint(websocket: WebSocket):
                                 if restful_audio_buffer:
                                     combined_audio = b''.join(restful_audio_buffer)
                                     logger.info(f"audio15 mode: Total audio size: {len(combined_audio)} bytes")
+
+                                    # Launch MiMo shadow now, in parallel with the (slower) OpenAI call.
+                                    pending_mimo_task = start_mimo_shadow(combined_audio)
 
                                     await websocket.send_text(json.dumps({
                                         "type": "text",

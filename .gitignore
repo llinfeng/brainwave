@@ -4,3 +4,4 @@ scratchpad.md
 .env
 venv/*
 realtime_server.log
+analysis_tmp/
