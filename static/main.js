@@ -13,6 +13,9 @@ let isAutoStarted = false;
 // Transcription mode: 'realtime' or 'restful'
 let transcriptionMode = 'restful';
 
+// Preferred microphone deviceId ('' = browser default), persisted across sessions
+let selectedMicId = localStorage.getItem('selectedMicId') || '';
+
 // Soundwave visualization
 let soundwaveCanvas, soundwaveCtx;
 let soundwaveData = [];
@@ -111,6 +114,7 @@ const readabilityButton = document.getElementById('readabilityButton');
 const askAIButton = document.getElementById('askAIButton');
 const correctnessButton = document.getElementById('correctnessButton');
 const modelSelect = document.getElementById('modelSelect');
+const micSelect = document.getElementById('micSelect');
 
 // Configuration
 const targetSeconds = 5;
@@ -292,6 +296,94 @@ function cleanupAudioResources() {
     recordButton.classList.remove('recording');
 
     console.log("Audio resources cleaned up");
+}
+
+// Microphone selection
+function micAudioConstraints() {
+    const audio = {
+        channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true
+    };
+    if (selectedMicId) audio.deviceId = { exact: selectedMicId };
+    return { audio };
+}
+
+// Rebuild the mic dropdown. The first entry always reflects the mic in use:
+// the live stream's device if we have one, else the persisted preference.
+// Device labels are only exposed by the browser after mic permission.
+async function populateMicList() {
+    if (!micSelect || !navigator.mediaDevices?.enumerateDevices) return;
+    let mics = [];
+    try {
+        mics = (await navigator.mediaDevices.enumerateDevices())
+            .filter(d => d.kind === 'audioinput');
+    } catch (e) {
+        console.error('enumerateDevices failed:', e);
+        return;
+    }
+
+    let activeId = '';
+    const track = stream?.getAudioTracks()[0];
+    if (track) activeId = track.getSettings().deviceId || '';
+
+    micSelect.innerHTML = '';
+    if (!mics.length || !mics.some(m => m.label)) {
+        const opt = document.createElement('option');
+        opt.value = '';
+        opt.textContent = '🎤 system default (names appear after mic access)';
+        micSelect.appendChild(opt);
+        return;
+    }
+    for (const m of mics) {
+        if (m.deviceId === 'default' && mics.length > 1) {
+            // Chrome lists a synthetic "default" duplicate; keep it — it tracks
+            // the OS default — but label it clearly.
+            const opt = document.createElement('option');
+            opt.value = '';
+            opt.textContent = '🎤 ' + (m.label.replace(/^Default( -)?\s*/i, 'System default: ') || 'System default');
+            micSelect.appendChild(opt);
+            continue;
+        }
+        const opt = document.createElement('option');
+        opt.value = m.deviceId;
+        opt.textContent = '🎤 ' + (m.label || `Microphone ${micSelect.options.length + 1}`);
+        micSelect.appendChild(opt);
+    }
+    const want = activeId || selectedMicId;
+    if (want && [...micSelect.options].some(o => o.value === want)) {
+        micSelect.value = want;
+    }
+}
+
+async function onMicSelectionChange() {
+    selectedMicId = micSelect.value;
+    localStorage.setItem('selectedMicId', selectedMicId);
+    console.log('Mic selection changed to:', selectedMicId || '(system default)');
+
+    if (isRecording && stream && audioContext) {
+        // Live swap: keep the audio graph, replace only the input stream.
+        try {
+            const newStream = await navigator.mediaDevices.getUserMedia(micAudioConstraints());
+            stream.getTracks().forEach(t => t.stop());
+            stream = newStream;
+            if (source) source.disconnect();
+            source = audioContext.createMediaStreamSource(stream);
+            source.connect(processor);
+            console.log('Live-swapped mic during recording');
+        } catch (e) {
+            console.error('Mic swap failed, keeping previous mic:', e);
+            alert('Could not switch to that microphone: ' + e.message);
+        }
+    } else if (stream) {
+        // Idle with a warm stream: drop it so the next Start re-acquires
+        // with the newly selected device.
+        stream.getTracks().forEach(t => t.stop());
+        stream = null;
+        streamInitialized = false;
+    }
+    populateMicList();
 }
 
 // Audio processing
@@ -501,18 +593,24 @@ async function startRecording() {
 
         if (!streamInitialized) {
             console.log('Requesting microphone access...');
-            stream = await navigator.mediaDevices.getUserMedia({
-                audio: {
-                    channelCount: 1,
-                    echoCancellation: true,
-                    noiseSuppression: true,
-                    autoGainControl: true
+            try {
+                stream = await navigator.mediaDevices.getUserMedia(micAudioConstraints());
+            } catch (e) {
+                if (selectedMicId) {
+                    // Preferred mic may be unplugged — fall back to default.
+                    console.warn('Selected mic unavailable, falling back to default:', e);
+                    selectedMicId = '';
+                    localStorage.setItem('selectedMicId', '');
+                    stream = await navigator.mediaDevices.getUserMedia(micAudioConstraints());
+                } else {
+                    throw e;
                 }
-            });
+            }
             console.log('Microphone access granted, stream:', stream);
             console.log('Audio tracks:', stream.getAudioTracks());
             streamInitialized = true;
             updateHeading();
+            populateMicList(); // labels become visible once permission is granted
         }
 
         if (!stream) throw new Error('Failed to initialize audio stream');
@@ -740,6 +838,10 @@ document.addEventListener('DOMContentLoaded', () => {
     initSoundwave();
     checkMicrophonePermission(); // Check mic permission status
     if (autoStart) initializeAudioStream();
+
+    populateMicList();
+    micSelect.onchange = onMicSelectionChange;
+    navigator.mediaDevices?.addEventListener?.('devicechange', populateMicList);
 });
 
 // Handle window resize for responsive soundwave
