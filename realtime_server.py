@@ -14,6 +14,7 @@ from openai_realtime_client import OpenAIRealtimeAudioTextClient
 from starlette.websockets import WebSocketState
 import wave
 import datetime
+import time
 import scipy.signal
 from openai import OpenAI, AsyncOpenAI
 from pydantic import BaseModel, Field
@@ -106,6 +107,25 @@ if MIMO_API_KEY:
 else:
     logger.info("MIMO_API_KEY not set; MiMo ASR shadow transcription disabled")
 
+# Aliyun Paraformer (second shadow). File-transcription API via the DashScope
+# SDK; docs: https://help.aliyun.com/zh/isi/developer-reference/api-details
+# Optional: skipped when the key or the dashscope package is missing.
+PARAFORMER_API_KEY = os.getenv("QWEN_Prepaid_10RMB_per_Month") or os.getenv("DASHSCOPE_API_KEY")
+PARAFORMER_ASR_MODEL = os.getenv("PARAFORMER_ASR_MODEL", "paraformer-mtl-v1")
+try:
+    from dashscope.audio.asr import Transcription as DashscopeTranscription
+    from dashscope.utils.oss_utils import check_and_upload_local as dashscope_upload_local
+    import requests as dashscope_requests
+    DASHSCOPE_SDK_AVAILABLE = True
+except ImportError:
+    DASHSCOPE_SDK_AVAILABLE = False
+if PARAFORMER_API_KEY and DASHSCOPE_SDK_AVAILABLE:
+    logger.info(f"Paraformer shadow transcription enabled ({PARAFORMER_ASR_MODEL})")
+elif PARAFORMER_API_KEY:
+    logger.info("dashscope package not installed; Paraformer shadow disabled (uv pip install dashscope)")
+else:
+    logger.info("No DashScope API key; Paraformer shadow transcription disabled")
+
 # Initialize with a default model
 llm_processor = get_llm_processor("gpt-4o")  # Default processor
 
@@ -132,6 +152,7 @@ class AudioProcessor:
         self.latest_audio_path = None
         self.latest_transcription_path = None
         self.transcription_model = None  # Which model produced current_transcription
+        self.transcription_elapsed = None  # End-to-end seconds the model took
 
     def process_audio_chunk(self, audio_data):
         # Convert binary audio data to Int16 array
@@ -169,6 +190,7 @@ class AudioProcessor:
         self.latest_audio_path = None
         self.latest_transcription_path = None
         self.transcription_model = None
+        self.transcription_elapsed = None
         return self.current_session_id
 
     def has_active_session(self):
@@ -186,6 +208,7 @@ class AudioProcessor:
         self.latest_audio_path = None
         self.latest_transcription_path = None
         self.transcription_model = None
+        self.transcription_elapsed = None
 
     def add_transcription_text(self, text):
         """Add transcription text to the current session"""
@@ -372,7 +395,8 @@ class AudioProcessor:
         logger.info(f"Saving transcription with filename: {filename}")
         logger.info(f"Full text path: {txt_path}")
 
-        model_note = f"\n\n---\n_Transcribed by: {self.transcription_model or 'unknown'}_\n"
+        elapsed_note = f" in {self.transcription_elapsed:.1f}s" if self.transcription_elapsed else ""
+        model_note = f"\n\n---\n_Transcribed by: {self.transcription_model or 'unknown'}{elapsed_note}_\n"
         with open(txt_path, 'wb') as f:  # Open in binary mode
             # Write UTF-8 BOM
             f.write(b'\xef\xbb\xbf')
@@ -460,6 +484,7 @@ async def transcribe_with_rest_api(audio_data: bytes, websocket: WebSocket, audi
     # transcript far shorter than plausible speech density flags a bad roll:
     # retry once (two tries total) and keep the longer transcript.
     duration_sec = len(audio_data) / (24000 * 2)
+    t_start = time.monotonic()
 
     async def _transcribe_once() -> str:
         with open(tmp_path, 'rb') as audio_file:
@@ -495,6 +520,7 @@ async def transcribe_with_rest_api(audio_data: bytes, websocket: WebSocket, audi
         if full_text:
             audio_processor.current_transcription = [full_text]
             audio_processor.transcription_model = "gpt-4o-transcribe"
+            audio_processor.transcription_elapsed = time.monotonic() - t_start
             if websocket.client_state == WebSocketState.CONNECTED:
                 await websocket.send_text(json.dumps({
                     "type": "text",
@@ -550,55 +576,143 @@ async def mimo_transcribe(wav_bytes: bytes) -> str:
         return ""
 
 
-async def mimo_transcribe_file(wav_path: str) -> str:
-    """MiMo transcription reading bytes from a saved WAV (fallback for modes
-    that don't keep a local PCM buffer, e.g. realtime)."""
+def paraformer_enabled() -> bool:
+    return bool(PARAFORMER_API_KEY and DASHSCOPE_SDK_AVAILABLE)
+
+
+def _paraformer_transcribe_sync(wav_bytes: bytes) -> str:
+    """Blocking DashScope flow (the SDK is sync; run via asyncio.to_thread):
+    temp WAV -> DashScope temp OSS bucket (readable only by this API key) ->
+    async transcription task -> download transcript JSON."""
+    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
+        f.write(wav_bytes)
+        tmp_path = f.name
     try:
-        with open(wav_path, 'rb') as f:
-            return await mimo_transcribe(f.read())
+        _, file_url, _ = dashscope_upload_local(
+            PARAFORMER_ASR_MODEL, f'file://{tmp_path}', PARAFORMER_API_KEY)
+        task = DashscopeTranscription.async_call(
+            model=PARAFORMER_ASR_MODEL,
+            file_urls=[file_url],
+            api_key=PARAFORMER_API_KEY,
+            headers={'X-DashScope-OssResourceResolve': 'enable'},
+        )
+        result = DashscopeTranscription.wait(task=task.output.task_id, api_key=PARAFORMER_API_KEY)
+        if result.status_code != 200:
+            logger.error(f"Paraformer task failed: {result.status_code} {result.output}")
+            return ""
+        texts = []
+        for r in result.output.get('results', []):
+            if r.get('subtask_status') != 'SUCCEEDED':
+                logger.error(f"Paraformer subtask failed: {json.dumps(r, ensure_ascii=False)}")
+                continue
+            detail = dashscope_requests.get(r['transcription_url'], timeout=30).json()
+            texts += [t.get('text', '') for t in detail.get('transcripts', [])]
+        return '\n'.join(t for t in texts if t).strip()
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
+async def paraformer_transcribe(wav_bytes: bytes) -> str:
+    """Transcribe WAV bytes with Aliyun paraformer; returns text ('' on error)."""
+    if not paraformer_enabled() or not wav_bytes:
+        return ""
+    try:
+        return await asyncio.to_thread(_paraformer_transcribe_sync, wav_bytes)
     except Exception as e:
-        logger.error(f"MiMo ASR shadow file read failed for {wav_path}: {e}", exc_info=True)
+        logger.error(f"Paraformer shadow transcription failed: {e}", exc_info=True)
         return ""
 
 
-def start_mimo_shadow(pcm_audio: bytes):
-    """Kick off MiMo transcription the moment audio is ready, in parallel with the
-    primary (OpenAI) call — Xiaomi usually finishes first on a slow OpenAI link.
-    Returns an asyncio Task yielding the transcript text, or None when disabled /
-    no audio. The file is written later (once the descriptive name exists)."""
-    if not MIMO_API_KEY or not pcm_audio:
-        return None
-    return asyncio.create_task(mimo_transcribe(pcm_to_wav_bytes(pcm_audio)))
+async def _timed(coro):
+    """Await `coro`, returning (result, elapsed_seconds). For shadows the timer
+    starts at task creation (the Stop moment), so elapsed is true end-to-end."""
+    t_start = time.monotonic()
+    result = await coro
+    return result, time.monotonic() - t_start
 
 
-def write_mimo_shadow(text: str, reference_txt_path: str):
-    """Write the MiMo shadow transcript as `<base>_by_MiMoASR.txt`, next to the
-    primary transcript, using the (already renamed) descriptive filename."""
+def write_shadow(text: str, reference_txt_path: str, suffix: str, model_label: str, elapsed: float = None):
+    """Write a shadow transcript as `<base>_{suffix}.txt`, next to the primary
+    transcript, using the (already renamed) descriptive filename."""
     if not text:
-        logger.warning("MiMo ASR shadow produced no text; nothing written")
+        logger.warning(f"{model_label} shadow produced no text; nothing written")
         return
     base, _ = os.path.splitext(reference_txt_path)
-    shadow_path = f"{base}_by_MiMoASR.txt"
-    model_note = f"\n\n---\n_Transcribed by: {MIMO_ASR_MODEL} (shadow)_\n"
+    shadow_path = f"{base}_{suffix}.txt"
+    elapsed_note = f" in {elapsed:.1f}s" if elapsed else ""
+    model_note = f"\n\n---\n_Transcribed by: {model_label} (shadow){elapsed_note}_\n"
     try:
         with open(shadow_path, 'wb') as f:
             f.write(b'\xef\xbb\xbf')
             f.write(text.encode('utf-8'))
             f.write(model_note.encode('utf-8'))
-        logger.info(f"MiMo ASR shadow transcript saved to {shadow_path} ({len(text)} chars)")
+        logger.info(f"{model_label} shadow transcript saved to {shadow_path} ({len(text)} chars)")
     except Exception as e:
-        logger.error(f"Failed to write MiMo shadow transcript to {shadow_path}: {e}", exc_info=True)
+        logger.error(f"Failed to write shadow transcript to {shadow_path}: {e}", exc_info=True)
 
 
-async def _finish_mimo_shadow(task, reference_txt_path: str):
-    """Await the in-flight MiMo task (started in parallel with OpenAI) and write
-    its transcript once the descriptive filename is known."""
+def start_shadow_tasks(pcm_audio: bytes):
+    """Kick off every enabled shadow transcription the moment audio is ready,
+    in parallel with the primary (OpenAI) call. Returns a list of
+    (task, suffix, model_label); files are written later, once the
+    descriptive filename exists."""
+    tasks = []
+    if not pcm_audio:
+        return tasks
+    wav_bytes = None
+    if MIMO_API_KEY or paraformer_enabled():
+        wav_bytes = pcm_to_wav_bytes(pcm_audio)
+    if MIMO_API_KEY:
+        tasks.append((asyncio.create_task(_timed(mimo_transcribe(wav_bytes))),
+                      "by_MiMoASR", MIMO_ASR_MODEL))
+    if paraformer_enabled():
+        tasks.append((asyncio.create_task(_timed(paraformer_transcribe(wav_bytes))),
+                      "by_ParaformerMTL", PARAFORMER_ASR_MODEL))
+    return tasks
+
+
+def start_shadow_tasks_from_file(wav_path: str):
+    """Late shadows for modes without a local PCM buffer (e.g. realtime):
+    read the saved WAV and run every enabled shadow engine on it."""
+    async def _from_file(fn):
+        try:
+            with open(wav_path, 'rb') as f:
+                data = f.read()
+        except Exception as e:
+            logger.error(f"Shadow file read failed for {wav_path}: {e}", exc_info=True)
+            return ""
+        return await fn(data)
+
+    tasks = []
+    if MIMO_API_KEY:
+        tasks.append((asyncio.create_task(_timed(_from_file(mimo_transcribe))),
+                      "by_MiMoASR", MIMO_ASR_MODEL))
+    if paraformer_enabled():
+        tasks.append((asyncio.create_task(_timed(_from_file(paraformer_transcribe))),
+                      "by_ParaformerMTL", PARAFORMER_ASR_MODEL))
+    return tasks
+
+
+async def _finish_shadow(task, reference_txt_path: str, suffix: str, model_label: str):
+    """Await one in-flight shadow task and write its transcript once the
+    descriptive filename is known."""
     try:
-        text = await task
+        text, elapsed = await task
     except Exception as e:
-        logger.error(f"MiMo ASR shadow await failed: {e}", exc_info=True)
+        logger.error(f"{model_label} shadow await failed: {e}", exc_info=True)
         return
-    write_mimo_shadow(text, reference_txt_path)
+    write_shadow(text, reference_txt_path, suffix, model_label, elapsed)
+
+
+def finish_shadow_tasks(tasks, reference_txt_path):
+    """Detach writers for all pending shadows (or cancel them when there is no
+    reference filename to sit next to). Never blocks finalize."""
+    for task, suffix, model_label in tasks:
+        if reference_txt_path:
+            asyncio.create_task(_finish_shadow(task, reference_txt_path, suffix, model_label))
+        else:
+            task.cancel()
 
 
 async def transcribe_wav_fallback(wav_path: str) -> str:
@@ -624,6 +738,7 @@ async def transcribe_wav_fallback(wav_path: str) -> str:
 async def transcribe_with_audio15(audio_data: bytes, websocket: WebSocket, audio_processor: AudioProcessor):
     """Transcribe audio using Chat Completions with gpt-audio-1.5"""
     client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+    t_start = time.monotonic()
 
     with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
         tmp_path = f.name
@@ -691,6 +806,7 @@ async def transcribe_with_audio15(audio_data: bytes, websocket: WebSocket, audio
         if transcript_text:
             audio_processor.current_transcription = [transcript_text]
             audio_processor.transcription_model = "gpt-audio-1.5"
+            audio_processor.transcription_elapsed = time.monotonic() - t_start
             if websocket.client_state == WebSocketState.CONNECTED:
                 await websocket.send_text(json.dumps({
                     "type": "text",
@@ -728,7 +844,7 @@ async def websocket_endpoint(websocket: WebSocket):
     # Track transcription mode for current session
     current_mode = "realtime"  # Default mode
     restful_audio_buffer = []  # Buffer for RESTful mode audio
-    pending_mimo_task = None   # In-flight MiMo shadow transcription (started at stop)
+    pending_shadow_tasks = []  # In-flight shadow transcriptions (started at stop)
 
     # Add synchronization for audio sending operations
     pending_audio_operations = 0
@@ -873,7 +989,7 @@ async def websocket_endpoint(websocket: WebSocket):
         logger.info(f"Handled {event_type} with data: {json.dumps(data, ensure_ascii=False)}")
 
     async def finalize_recording(success=False, reason="", notify_client=True):
-        nonlocal client, pending_audio_chunks, pending_audio_operations, restful_audio_buffer, pending_mimo_task
+        nonlocal client, pending_audio_chunks, pending_audio_operations, restful_audio_buffer, pending_shadow_tasks
 
         async with finalize_lock:
             logger.info(f"Finalizing recording (success={success}, reason={reason})")
@@ -897,10 +1013,12 @@ async def websocket_endpoint(websocket: WebSocket):
                 if not transcription_path and audio_path and os.path.exists(audio_path):
                     try:
                         logger.info(f"No transcript from primary path; auto-fallback on {audio_path}")
+                        t_fallback = time.monotonic()
                         recovered = await transcribe_wav_fallback(audio_path)
                         if recovered:
                             audio_processor.current_transcription = [recovered]
                             audio_processor.transcription_model = "gpt-4o-transcribe (auto-fallback)"
+                            audio_processor.transcription_elapsed = time.monotonic() - t_fallback
                             audio_processor.current_filename = None  # regenerate a descriptive name
                             transcription_path = audio_processor.save_transcription()
                             # Rename the placeholder WAV (recording-too-short / timestamp) to match,
@@ -935,22 +1053,18 @@ async def websocket_endpoint(websocket: WebSocket):
                 if success and audio_path and transcription_path:
                     audio_processor.cleanup_timestamp_backup()
 
-                # Shadow testing: MiMo was launched in parallel with the OpenAI
-                # call the moment audio was buffered (start_mimo_shadow), so it's
-                # usually already done by now. Write its sibling transcript using
-                # the descriptive name. Non-blocking so it never delays finalize.
+                # Shadow testing: shadows (MiMo, Paraformer) were launched in
+                # parallel with the OpenAI call the moment audio was buffered
+                # (start_shadow_tasks), so they're usually already done by now.
+                # Write their sibling transcripts using the descriptive name.
+                # Non-blocking so this never delays finalize.
                 reference = transcription_path or audio_path
-                if pending_mimo_task is not None:
-                    if reference:
-                        asyncio.create_task(_finish_mimo_shadow(pending_mimo_task, reference))
-                    else:
-                        pending_mimo_task.cancel()
-                    pending_mimo_task = None
-                elif MIMO_API_KEY and reference and audio_path and os.path.exists(audio_path):
-                    # Modes without a local PCM buffer (e.g. realtime): late shadow from the WAV.
-                    asyncio.create_task(
-                        _finish_mimo_shadow(asyncio.create_task(mimo_transcribe_file(audio_path)), reference)
-                    )
+                if pending_shadow_tasks:
+                    finish_shadow_tasks(pending_shadow_tasks, reference)
+                    pending_shadow_tasks = []
+                elif reference and audio_path and os.path.exists(audio_path):
+                    # Modes without a local PCM buffer (e.g. realtime): late shadows from the WAV.
+                    finish_shadow_tasks(start_shadow_tasks_from_file(audio_path), reference)
 
                 audio_processor.end_session()
             else:
@@ -986,7 +1100,7 @@ async def websocket_endpoint(websocket: WebSocket):
             logger.info("Finalize recording completed")
 
     async def receive_messages():
-        nonlocal client, current_mode, restful_audio_buffer, pending_audio_operations, pending_mimo_task
+        nonlocal client, current_mode, restful_audio_buffer, pending_audio_operations, pending_shadow_tasks
 
         try:
             while True:
@@ -1127,8 +1241,8 @@ async def websocket_endpoint(websocket: WebSocket):
                                     combined_audio = b''.join(restful_audio_buffer)
                                     logger.info(f"RESTful mode: Total audio size: {len(combined_audio)} bytes")
 
-                                    # Launch MiMo shadow now, in parallel with the (slower) OpenAI call.
-                                    pending_mimo_task = start_mimo_shadow(combined_audio)
+                                    # Launch shadows (MiMo, Paraformer) now, in parallel with the (slower) OpenAI call.
+                                    pending_shadow_tasks = start_shadow_tasks(combined_audio)
 
                                     # Send new response indicator
                                     await websocket.send_text(json.dumps({
@@ -1173,8 +1287,8 @@ async def websocket_endpoint(websocket: WebSocket):
                                     combined_audio = b''.join(restful_audio_buffer)
                                     logger.info(f"audio15 mode: Total audio size: {len(combined_audio)} bytes")
 
-                                    # Launch MiMo shadow now, in parallel with the (slower) OpenAI call.
-                                    pending_mimo_task = start_mimo_shadow(combined_audio)
+                                    # Launch shadows (MiMo, Paraformer) now, in parallel with the (slower) OpenAI call.
+                                    pending_shadow_tasks = start_shadow_tasks(combined_audio)
 
                                     await websocket.send_text(json.dumps({
                                         "type": "text",
@@ -1497,6 +1611,7 @@ async def upload_wav_transcribe(file: UploadFile = File(...)):
         
         try:
             # Transcribe via gpt-4o-transcribe (matches the 🟢 dropdown option).
+            t_start = time.monotonic()
             with open(tmp_file_path, 'rb') as audio_file:
                 transcript = await client.audio.transcriptions.create(
                     model="gpt-4o-transcribe",
@@ -1504,6 +1619,7 @@ async def upload_wav_transcribe(file: UploadFile = File(...)):
                     response_format="text",
                     prompt=TRANSCRIBE_HINT,
                 )
+            upload_elapsed = time.monotonic() - t_start
 
             logger.info(f"Successfully transcribed WAV file with gpt-4o-transcribe: {file.filename}")
             logger.info(f"Transcription length: {len(transcript)} characters")
@@ -1517,6 +1633,7 @@ async def upload_wav_transcribe(file: UploadFile = File(...)):
             naming_processor.current_filename = None
             naming_processor._header_removed = True
             naming_processor.transcription_model = "gpt-4o-transcribe (manual upload)"
+            naming_processor.transcription_elapsed = upload_elapsed
 
             txt_path = None
             try:
