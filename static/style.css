@@ -101,6 +101,70 @@ h1 {
     margin-top: 30px;
 }
 
+/* Main (ChatGPT) transcript on top; shadow-engine tabs stacked BELOW it, each
+   full width. (The page column is only 800px — side-by-side was cramped.) */
+.transcript-row { display: block; }
+.transcript-container textarea,
+.shadow-body textarea {
+    padding-right: 80px;   /* keep text clear of the overlaid Copy button */
+}
+.shadow-container {
+    margin-top: 12px;
+}
+.shadow-container[hidden] { display: none; }
+.shadow-body {
+    position: relative;    /* anchors Copy to the textarea, not the tab row */
+}
+.shadow-body textarea {
+    min-height: 150px;
+}
+.shadow-tabs {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    margin-bottom: 6px;
+}
+.shadow-tab {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border: 1px solid #e0e0e0;
+    border-radius: 8px 8px 0 0;
+    background: #f2f2f2;
+    font-size: 0.8rem;
+    cursor: pointer;
+    color: #333;
+    user-select: none;
+}
+.shadow-tab.active {
+    background: #fff;
+    border-bottom-color: #fff;
+    font-weight: 600;
+}
+.shadow-tab.loading {
+    cursor: default;
+    opacity: 0.75;
+}
+.shadow-tab.empty {
+    color: #b91c1c;
+}
+/* Rotating icon shown while an engine is still transcribing. */
+.shadow-spinner {
+    width: 11px;
+    height: 11px;
+    border: 2px solid #c7c7cc;
+    border-top-color: #007AFF;
+    border-radius: 50%;
+    animation: shadow-spin 0.8s linear infinite;
+}
+@keyframes shadow-spin { to { transform: rotate(360deg); } }
+.shadow-elapsed {
+    font-weight: 400;
+    opacity: 0.65;
+    font-size: 0.72rem;
+}
+
 textarea {
     width: 100%;
     min-height: 150px;
@@ -113,6 +177,38 @@ textarea {
     resize: vertical;
     box-sizing: border-box;
 }
+
+/* Save: write the edited transcript back to its .txt (footer with time-spent kept). */
+.save-button {
+    position: absolute;
+    top: 15px;
+    right: 80px;
+    padding: 8px 12px;
+    background: #34C759;
+    color: white;
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 0.9rem;
+    z-index: 1;
+}
+.save-button:disabled { opacity: 0.45; cursor: default; }
+
+/* Autosave status, left of the Save button: Unsaved changes → Saving… → Saved HH:MM ✓ */
+.save-status {
+    position: absolute;
+    top: 22px;
+    right: 150px;
+    font-size: 0.75rem;
+    color: #8e8e93;
+    z-index: 1;
+    pointer-events: none;
+    white-space: nowrap;
+}
+.save-status.dirty  { color: #d97706; }
+.save-status.saving { color: #007AFF; }
+.save-status.saved  { color: #1a7f37; }
+.save-status.failed { color: #b91c1c; }
 
 .copy-button {
     position: absolute;
@@ -335,6 +431,20 @@ body.dark-theme textarea {
     background: #1c1c1e;
     color: #f5f5f7;
     border-color: #3a3a3c;
+}
+
+body.dark-theme .shadow-tab {
+    background: #2c2c2e;
+    border-color: #3a3a3c;
+    color: #e5e5ea;
+}
+body.dark-theme .shadow-tab.active {
+    background: #1c1c1e;
+    border-bottom-color: #1c1c1e;
+}
+body.dark-theme .shadow-spinner {
+    border-color: #48484a;
+    border-top-color: #34C759;
 }
 
 body.dark-theme .action-button {

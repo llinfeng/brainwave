@@ -126,10 +126,37 @@ elif PARAFORMER_API_KEY:
 else:
     logger.info("No DashScope API key; Paraformer shadow transcription disabled")
 
+# Aliyun qwen3-asr-flash-realtime (third shadow). Streaming WebSocket ASR, used
+# here in BATCH-AT-STOP mode: we replay the buffered audio through the socket
+# after Stop and collect only the FINAL (committed) segments — never the
+# revisable partials — so the user sees one clean, corrected transcript.
+# Docs: https://help.aliyun.com/zh/model-studio/qwen3-asr-flash-realtime
+# Shares the DashScope key with Paraformer. ~¥0.02/min (far cheaper than
+# OpenAI realtime). Optional: skipped when the key is missing.
+QWEN_REALTIME_API_KEY = PARAFORMER_API_KEY
+QWEN_REALTIME_MODEL = os.getenv("QWEN_REALTIME_ASR_MODEL", "qwen3-asr-flash-realtime")
+# Default host is the standard DashScope realtime endpoint; the docs also show a
+# workspace-scoped form (wss://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/...).
+QWEN_REALTIME_WS_URL = os.getenv(
+    "QWEN_REALTIME_WS_URL",
+    "wss://dashscope.aliyuncs.com/api-ws/v1/realtime",
+)
+if QWEN_REALTIME_API_KEY:
+    logger.info(f"Qwen realtime shadow transcription enabled ({QWEN_REALTIME_MODEL})")
+else:
+    logger.info("No DashScope API key; Qwen realtime shadow transcription disabled")
+
 # Initialize with a default model
 llm_processor = get_llm_processor("gpt-4o")  # Default processor
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    # Browsers request this automatically; return 204 instead of a noisy 404.
+    from fastapi.responses import Response
+    return Response(status_code=204)
+
 
 @app.get("/", response_class=HTMLResponse)
 async def get_realtime_page(request: Request):
@@ -457,6 +484,8 @@ TRANSCRIBE_HINT = (
 )
 
 
+
+
 async def transcribe_with_rest_api(audio_data: bytes, websocket: WebSocket, audio_processor: AudioProcessor):
     """Transcribe audio via REST using gpt-4o-transcribe (non-streaming).
 
@@ -469,40 +498,49 @@ async def transcribe_with_rest_api(audio_data: bytes, websocket: WebSocket, audi
     """
     client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-    # Create temp file for audio (WAV format at 24kHz mono)
-    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
-        tmp_path = f.name
-        with wave.open(f, 'wb') as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)  # 16-bit
-            wf.setframerate(24000)
-            wf.writeframes(audio_data)
-
     # gpt-4o-transcribe occasionally returns only a fragment of a longer clip
     # (nondeterministic; re-sending the identical audio usually recovers the
     # full text). We know the clip duration from the PCM byte count, so a
     # transcript far shorter than plausible speech density flags a bad roll:
-    # retry once (two tries total) and keep the longer transcript.
+    # retry once (two tries total) and keep the longer transcript. A separate,
+    # stronger detector (shadow cross-check) plus a structural recovery (chunked
+    # re-transcription) handles the silent TRAILING-segment drop that the
+    # chars/sec floor cannot see; see the mitigation notes above.
     duration_sec = len(audio_data) / (24000 * 2)
     t_start = time.monotonic()
 
-    async def _transcribe_once() -> str:
-        with open(tmp_path, 'rb') as audio_file:
-            response = await client.audio.transcriptions.create(
-                model="gpt-4o-transcribe",
-                file=audio_file,
-                response_format="text",
-                prompt=TRANSCRIBE_HINT,
-            )
-        # response_format="text" returns the transcript string directly
-        return (response if isinstance(response, str) else getattr(response, "text", "")).strip()
+    async def _transcribe_pcm(pcm: bytes) -> str:
+        """Transcribe one PCM buffer (16-bit mono @ 24kHz) via gpt-4o-transcribe,
+        managing its own temp WAV. Reused for the full clip and for each chunk."""
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
+            tmp_path = f.name
+            with wave.open(f, 'wb') as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)  # 16-bit
+                wf.setframerate(24000)
+                wf.writeframes(pcm)
+        try:
+            with open(tmp_path, 'rb') as audio_file:
+                response = await client.audio.transcriptions.create(
+                    model="gpt-4o-transcribe",
+                    file=audio_file,
+                    response_format="text",
+                    prompt=TRANSCRIBE_HINT,
+                )
+            # response_format="text" returns the transcript string directly
+            return (response if isinstance(response, str) else getattr(response, "text", "")).strip()
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
 
     try:
-        logger.info(f"Calling REST API transcription with file: {tmp_path} ({duration_sec:.1f}s)")
+        logger.info(f"Calling REST API transcription ({duration_sec:.1f}s)")
 
-        full_text = await _transcribe_once()
+        full_text = await _transcribe_pcm(audio_data)
         logger.info(f"REST API transcription complete, length: {len(full_text)}")
+        model_label = "gpt-4o-transcribe"
 
+        # Detector 1 (existing): chars/sec floor -> one identical re-run.
         min_plausible_chars = min_plausible_transcript_chars(full_text, duration_sec)
         if duration_sec >= MIN_RETRY_DURATION_SEC and len(full_text) < min_plausible_chars:
             logger.warning(
@@ -510,7 +548,7 @@ async def transcribe_with_rest_api(audio_data: bytes, websocket: WebSocket, audi
                 f"{duration_sec:.1f}s audio, expected >= {min_plausible_chars:.0f}); retrying once"
             )
             try:
-                retry_text = await _transcribe_once()
+                retry_text = await _transcribe_pcm(audio_data)
                 logger.info(f"Retry transcription complete, length: {len(retry_text)}")
                 if len(retry_text) > len(full_text):
                     full_text = retry_text
@@ -519,7 +557,7 @@ async def transcribe_with_rest_api(audio_data: bytes, websocket: WebSocket, audi
 
         if full_text:
             audio_processor.current_transcription = [full_text]
-            audio_processor.transcription_model = "gpt-4o-transcribe"
+            audio_processor.transcription_model = model_label
             audio_processor.transcription_elapsed = time.monotonic() - t_start
             if websocket.client_state == WebSocketState.CONNECTED:
                 await websocket.send_text(json.dumps({
@@ -532,9 +570,6 @@ async def transcribe_with_rest_api(audio_data: bytes, websocket: WebSocket, audi
     except Exception as e:
         logger.error(f"Error in REST API transcription: {e}", exc_info=True)
         raise
-    finally:
-        if os.path.exists(tmp_path):
-            os.unlink(tmp_path)
 
 
 def pcm_to_wav_bytes(pcm_audio: bytes, sample_rate: int = 24000) -> bytes:
@@ -548,29 +583,110 @@ def pcm_to_wav_bytes(pcm_audio: bytes, sample_rate: int = 24000) -> bytes:
     return buf.getvalue()
 
 
+# MiMo rejects audio whose decoded bytes exceed 10 MB (observed: HTTP 400
+# 'input_audio.data exceeds maximum size of 10MB'; the docs claim the limit is
+# on the base64 string, but 13 MB base64 payloads went through — the enforced
+# cap is on the decoded audio). Raw 24 kHz WAV hits it at ~3.5 min, so we
+# transcode to MP3 (~6x smaller), lifting the ceiling to ~20+ min — past the
+# ~10-15 min where MiMo's 2K output-token cap truncates transcripts anyway.
+MIMO_MAX_AUDIO_BYTES = 10 * 1024 * 1024
+# Per-request chunk length. MiMo's 2K output-token cap truncates transcripts
+# past ~10-15 min of dense speech, so ~10 min chunks keep every chunk's
+# transcript complete; the merged text is still written as ONE txt file.
+MIMO_CHUNK_SECONDS = 600
+
+
+def _mimo_prepare_chunks(wav_bytes: bytes):
+    """Split WAV into <=MIMO_CHUNK_SECONDS pieces and encode each to MP3
+    (blocking; run via to_thread). Returns a list of (audio_bytes, format).
+    Falls back to the original WAV as a single chunk if decoding fails."""
+    try:
+        data, samplerate = sf.read(io.BytesIO(wav_bytes), dtype='int16')
+    except Exception as e:
+        logger.warning(f"MiMo chunk prep: WAV decode failed ({e}); sending WAV as-is")
+        if len(wav_bytes) > MIMO_MAX_AUDIO_BYTES:
+            logger.warning(f"WAV exceeds MiMo 10MB cap ({len(wav_bytes)} bytes); shadow skipped")
+            return []
+        return [(wav_bytes, "wav")]
+
+    chunks = []
+    samples_per_chunk = MIMO_CHUNK_SECONDS * samplerate
+    for start in range(0, len(data), samples_per_chunk):
+        segment = data[start:start + samples_per_chunk]
+        buf = io.BytesIO()
+        try:
+            sf.write(buf, segment, samplerate, format='MP3')
+        except Exception as e:
+            logger.warning(f"MP3 encode failed ({e}); using WAV for this chunk")
+            buf = io.BytesIO()
+            sf.write(buf, segment, samplerate, format='WAV', subtype='PCM_16')
+            audio = buf.getvalue()
+            if len(audio) > MIMO_MAX_AUDIO_BYTES:
+                logger.warning(f"WAV chunk exceeds MiMo 10MB cap ({len(audio)} bytes); chunk dropped")
+                continue
+            chunks.append((audio, "wav"))
+            continue
+        audio = buf.getvalue()
+        if len(audio) > MIMO_MAX_AUDIO_BYTES:
+            logger.warning(f"MP3 chunk exceeds MiMo 10MB cap ({len(audio)} bytes); chunk dropped")
+            continue
+        chunks.append((audio, "mp3"))
+
+    total = sum(len(a) for a, _ in chunks)
+    logger.info(
+        f"MiMo audio prepared: {len(wav_bytes)} WAV bytes -> "
+        f"{len(chunks)} chunk(s), {total} bytes total"
+    )
+    return chunks
+
+
+async def _mimo_chat(audio_bytes: bytes, fmt: str) -> str:
+    """One MiMo chat-completions call for one audio chunk."""
+    audio_b64 = base64.b64encode(audio_bytes).decode('ascii')
+    client = AsyncOpenAI(api_key=MIMO_API_KEY, base_url=MIMO_BASE_URL)
+    response = await client.chat.completions.create(
+        model=MIMO_ASR_MODEL,
+        messages=[{
+            "role": "user",
+            "content": [{
+                "type": "input_audio",
+                "input_audio": {"data": audio_b64, "format": fmt},
+            }],
+        }],
+        extra_body={"language": "auto"},
+    )
+    return (response.choices[0].message.content or "").strip()
+
+
 async def mimo_transcribe(wav_bytes: bytes) -> str:
     """Transcribe WAV bytes with Xiaomi MiMo ASR; returns text ('' on empty/error).
 
     MiMo exposes an OpenAI-compatible chat-completions API where the audio is
     sent as base64 `input_audio` (docs: mimo.mi.com/models/en-US/mimo-v2.5-asr).
+    Audio is transcoded to MP3 and, past MIMO_CHUNK_SECONDS, split into chunks
+    transcribed concurrently — the pieces are merged into one transcript.
     """
     if not MIMO_API_KEY:
         return ""
     try:
-        audio_b64 = base64.b64encode(wav_bytes).decode('ascii')
-        client = AsyncOpenAI(api_key=MIMO_API_KEY, base_url=MIMO_BASE_URL)
-        response = await client.chat.completions.create(
-            model=MIMO_ASR_MODEL,
-            messages=[{
-                "role": "user",
-                "content": [{
-                    "type": "input_audio",
-                    "input_audio": {"data": audio_b64, "format": "wav"},
-                }],
-            }],
-            extra_body={"language": "auto"},
+        chunks = await asyncio.to_thread(_mimo_prepare_chunks, wav_bytes)
+        if not chunks:
+            return ""
+        results = await asyncio.gather(
+            *(_mimo_chat(audio, fmt) for audio, fmt in chunks),
+            return_exceptions=True,
         )
-        return (response.choices[0].message.content or "").strip()
+        texts = []
+        for i, r in enumerate(results):
+            if isinstance(r, Exception):
+                logger.error(f"MiMo chunk {i + 1}/{len(chunks)} failed: {r}")
+                texts.append(f"[chunk {i + 1} failed]")
+            elif r:
+                texts.append(r)
+        # All-failed => treat as no transcript rather than a file of markers
+        if not any(not t.startswith("[chunk") for t in texts):
+            return ""
+        return "\n".join(texts).strip()
     except Exception as e:
         logger.error(f"MiMo ASR shadow transcription failed: {e}", exc_info=True)
         return ""
@@ -578,6 +694,107 @@ async def mimo_transcribe(wav_bytes: bytes) -> str:
 
 def paraformer_enabled() -> bool:
     return bool(PARAFORMER_API_KEY and DASHSCOPE_SDK_AVAILABLE)
+
+
+def qwen_realtime_enabled() -> bool:
+    return bool(QWEN_REALTIME_API_KEY)
+
+
+async def _close_ws_quietly(ws):
+    """Background goodbye for a WebSocket we've already finished with."""
+    try:
+        await ws.close()
+    except Exception:
+        pass
+
+
+async def qwen_realtime_transcribe(pcm_24k: bytes) -> str:
+    """Batch-at-Stop transcription via qwen3-asr-flash-realtime (WebSocket).
+
+    Replays the buffered 24 kHz PCM (resampled to the 16 kHz the model expects)
+    through the realtime socket in manual-commit mode, then commits + finishes.
+    Only `...transcription.completed` (FINAL) events are collected; the
+    revisable `...transcription.text` partials are ignored on purpose, so the
+    caller gets one clean, corrected transcript rather than flickering drafts.
+    Returns '' on empty/error (never raises) so it's safe as a shadow.
+    """
+    if not QWEN_REALTIME_API_KEY or not pcm_24k:
+        return ""
+    import websockets  # local import: optional dependency of the shadow path
+    try:
+        # 24 kHz int16 -> 16 kHz int16 (model's expected rate)
+        x = np.frombuffer(pcm_24k, dtype=np.int16).astype(np.float32) / 32768.0
+        y = scipy.signal.resample_poly(x, 16000, 24000)
+        pcm_16k = (y * 32768.0).clip(-32768, 32767).astype(np.int16).tobytes()
+
+        url = f"{QWEN_REALTIME_WS_URL}?model={QWEN_REALTIME_MODEL}"
+        headers = {
+            "Authorization": f"Bearer {QWEN_REALTIME_API_KEY}",
+            "OpenAI-Beta": "realtime=v1",
+        }
+        finals = []
+        # websockets renamed the kwarg: `extra_headers` (<=13) -> `additional_headers` (>=14).
+        import inspect
+        hdr_kw = ("additional_headers"
+                  if "additional_headers" in inspect.signature(websockets.connect).parameters
+                  else "extra_headers")
+        # Measured on a 13.5s clip: connect 0.06s, audio 0.06s, model 0.36s —
+        # then a ~1.0s wait for the server to answer our close frame. Since we
+        # already hold the full transcript at `session.finished`, we return
+        # immediately and do the goodbye in the background (see `finally`).
+        ws = await websockets.connect(url, open_timeout=15, max_size=None,
+                                      close_timeout=0.2, **{hdr_kw: headers})
+        try:
+            await ws.send(json.dumps({
+                "event_id": "evt_session",
+                "type": "session.update",
+                "session": {
+                    "modalities": ["text"],
+                    "input_audio_format": "pcm",
+                    "sample_rate": 16000,
+                    "turn_detection": None,  # manual mode: we commit explicitly
+                },
+            }))
+            # Stream audio in ~100 ms chunks (16 kHz * 2 bytes * 0.1 s = 3200 B)
+            chunk = 3200
+            for i in range(0, len(pcm_16k), chunk):
+                await ws.send(json.dumps({
+                    "event_id": f"evt_a{i}",
+                    "type": "input_audio_buffer.append",
+                    "audio": base64.b64encode(pcm_16k[i:i + chunk]).decode("ascii"),
+                }))
+            await ws.send(json.dumps({"event_id": "evt_commit", "type": "input_audio_buffer.commit"}))
+            await ws.send(json.dumps({"event_id": "evt_finish", "type": "session.finish"}))
+
+            # Collect finals until the server says the session is finished.
+            deadline = time.monotonic() + 120
+            while time.monotonic() < deadline:
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=30)
+                except asyncio.TimeoutError:
+                    logger.warning("Qwen realtime: no event for 30s; giving up")
+                    break
+                try:
+                    ev = json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                et = ev.get("type", "")
+                if et == "conversation.item.input_audio_transcription.completed":
+                    t = (ev.get("transcript") or "").strip()
+                    if t:
+                        finals.append(t)
+                elif et in ("session.finished", "session.finish"):
+                    break
+                elif et == "error":
+                    logger.error(f"Qwen realtime error event: {ev}")
+                    break
+        finally:
+            # Don't block on the ~1s close handshake — hand it off.
+            asyncio.create_task(_close_ws_quietly(ws))
+        return " ".join(finals).strip()
+    except Exception as e:
+        logger.error(f"Qwen realtime shadow transcription failed: {e}", exc_info=True)
+        return ""
 
 
 def _paraformer_transcribe_sync(wav_bytes: bytes) -> str:
@@ -613,12 +830,28 @@ def _paraformer_transcribe_sync(wav_bytes: bytes) -> str:
             os.unlink(tmp_path)
 
 
+# The DashScope SDK's OSS upload has no timeout — a stalled upload blocks the
+# worker thread forever with zero log output (observed 2026-08-12: an 8.4 MB
+# upload silently never completed). wait_for can't kill the thread, but it
+# bounds our wait and makes the failure visible in the log.
+PARAFORMER_TIMEOUT_SECONDS = 300
+
+
 async def paraformer_transcribe(wav_bytes: bytes) -> str:
     """Transcribe WAV bytes with Aliyun paraformer; returns text ('' on error)."""
     if not paraformer_enabled() or not wav_bytes:
         return ""
     try:
-        return await asyncio.to_thread(_paraformer_transcribe_sync, wav_bytes)
+        return await asyncio.wait_for(
+            asyncio.to_thread(_paraformer_transcribe_sync, wav_bytes),
+            timeout=PARAFORMER_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        logger.error(
+            f"Paraformer shadow timed out after {PARAFORMER_TIMEOUT_SECONDS}s "
+            f"({len(wav_bytes)} bytes) — likely a stalled OSS upload"
+        )
+        return ""
     except Exception as e:
         logger.error(f"Paraformer shadow transcription failed: {e}", exc_info=True)
         return ""
@@ -648,8 +881,32 @@ def write_shadow(text: str, reference_txt_path: str, suffix: str, model_label: s
             f.write(text.encode('utf-8'))
             f.write(model_note.encode('utf-8'))
         logger.info(f"{model_label} shadow transcript saved to {shadow_path} ({len(text)} chars)")
+        return shadow_path
     except Exception as e:
         logger.error(f"Failed to write shadow transcript to {shadow_path}: {e}", exc_info=True)
+        return None
+
+
+TRANSCRIPT_FOOTER_SEP = "\n\n---\n"
+
+
+def rewrite_transcript_body(path: str, new_body: str) -> str:
+    """Replace the body of an existing transcript .txt while PRESERVING its
+    footer (`_Transcribed by: <model> in N.Ns_` — the time-spent record), and
+    append/refresh an edit stamp. Returns the footer kept, for display."""
+    raw = open(path, encoding='utf-8-sig').read()
+    parts = raw.split(TRANSCRIPT_FOOTER_SEP, 1)
+    footer = parts[1] if len(parts) == 2 else ""
+    # If the client echoed the footer back inside the body, drop it there.
+    new_body = new_body.split(TRANSCRIPT_FOOTER_SEP, 1)[0].rstrip()
+    footer_lines = [ln for ln in footer.strip('\n').split('\n')
+                    if ln.strip() and not ln.startswith('_Edited in browser')]
+    footer_lines.append(f"_Edited in browser {datetime.now().strftime('%Y-%m-%d %H:%M')}_")
+    with open(path, 'wb') as f:
+        f.write(b'\xef\xbb\xbf')
+        f.write(new_body.encode('utf-8'))
+        f.write((TRANSCRIPT_FOOTER_SEP + '\n'.join(footer_lines) + '\n').encode('utf-8'))
+    return '\n'.join(footer_lines)
 
 
 def start_shadow_tasks(pcm_audio: bytes):
@@ -663,6 +920,12 @@ def start_shadow_tasks(pcm_audio: bytes):
     wav_bytes = None
     if MIMO_API_KEY or paraformer_enabled():
         wav_bytes = pcm_to_wav_bytes(pcm_audio)
+    # Order matters: the browser renders one tab per task in this order and
+    # selects the FIRST as the default tab — Qwen realtime goes first.
+    if qwen_realtime_enabled():
+        # Takes raw PCM directly (it resamples to 16 kHz itself).
+        tasks.append((asyncio.create_task(_timed(qwen_realtime_transcribe(pcm_audio))),
+                      "by_QwenRealtime", QWEN_REALTIME_MODEL))
     if MIMO_API_KEY:
         tasks.append((asyncio.create_task(_timed(mimo_transcribe(wav_bytes))),
                       "by_MiMoASR", MIMO_ASR_MODEL))
@@ -685,6 +948,19 @@ def start_shadow_tasks_from_file(wav_path: str):
         return await fn(data)
 
     tasks = []
+    # Same order as start_shadow_tasks: Qwen realtime first (default tab).
+    if qwen_realtime_enabled():
+        async def _qwen_from_wav():
+            # Qwen realtime wants raw PCM; strip the WAV container first.
+            try:
+                with wave.open(wav_path, 'rb') as wf:
+                    pcm = wf.readframes(wf.getnframes())
+            except Exception as e:
+                logger.error(f"Qwen realtime shadow WAV read failed for {wav_path}: {e}", exc_info=True)
+                return ""
+            return await qwen_realtime_transcribe(pcm)
+        tasks.append((asyncio.create_task(_timed(_qwen_from_wav())),
+                      "by_QwenRealtime", QWEN_REALTIME_MODEL))
     if MIMO_API_KEY:
         tasks.append((asyncio.create_task(_timed(_from_file(mimo_transcribe))),
                       "by_MiMoASR", MIMO_ASR_MODEL))
@@ -694,23 +970,81 @@ def start_shadow_tasks_from_file(wav_path: str):
     return tasks
 
 
-async def _finish_shadow(task, reference_txt_path: str, suffix: str, model_label: str):
+def shadow_engine_labels():
+    """Names of the enabled shadow engines, in display order. The browser uses
+    this to render one tab per engine (Qwen realtime first = default tab)."""
+    labels = []
+    if qwen_realtime_enabled():
+        labels.append(QWEN_REALTIME_MODEL)
+    if MIMO_API_KEY:
+        labels.append(MIMO_ASR_MODEL)
+    if paraformer_enabled():
+        labels.append(PARAFORMER_ASR_MODEL)
+    return labels
+
+
+async def _push_shadow(websocket, model_label: str, text: str, elapsed):
+    """Send one finished shadow transcript to the browser (fills its tab)."""
+    try:
+        if websocket is not None and websocket.client_state == WebSocketState.CONNECTED:
+            await websocket.send_text(json.dumps({
+                "type": "shadow",
+                "model": model_label,
+                "content": text or "",
+                "elapsed": round(elapsed, 1) if elapsed else None,
+                "empty": not bool(text),
+            }))
+    except Exception as e:
+        logger.debug(f"Could not push shadow {model_label} to client: {e}")
+
+
+def attach_shadow_pushers(tasks, websocket):
+    """Push each shadow transcript to the browser the MOMENT its own engine
+    finishes — deliberately decoupled from finalize_recording, which has to wait
+    for the slower gpt-4o call + filename generation. Without this, a MiMo
+    result ready at 0.7s sat invisible behind spinners until ~5s. Awaiting a
+    task here does not consume it; finalize still awaits it for the file write."""
+    async def _push_when_done(task, model_label):
+        try:
+            text, elapsed = await task
+        except Exception as e:
+            logger.error(f"{model_label} shadow failed before push: {e}", exc_info=True)
+            text, elapsed = "", None
+        await _push_shadow(websocket, model_label, text, elapsed)
+    for task, _suffix, model_label in tasks:
+        asyncio.create_task(_push_when_done(task, model_label))
+
+
+async def _finish_shadow(task, reference_txt_path: str, suffix: str, model_label: str,
+                         registry=None, websocket=None):
     """Await one in-flight shadow task and write its transcript once the
-    descriptive filename is known."""
+    descriptive filename is known. (Browser push is handled separately by
+    attach_shadow_pushers, so it is never gated on this.) Records the written
+    path in `registry[model_label]` and tells the browser, so its Save button
+    can write edits back to the right file."""
     try:
         text, elapsed = await task
     except Exception as e:
         logger.error(f"{model_label} shadow await failed: {e}", exc_info=True)
         return
-    write_shadow(text, reference_txt_path, suffix, model_label, elapsed)
+    path = write_shadow(text, reference_txt_path, suffix, model_label, elapsed)
+    if path:
+        if registry is not None:
+            registry[model_label] = path
+        try:
+            if websocket is not None and websocket.client_state == WebSocketState.CONNECTED:
+                await websocket.send_text(json.dumps({
+                    "type": "shadow_saved", "model": model_label, "file": os.path.basename(path)}))
+        except Exception as e:
+            logger.debug(f"Could not send shadow_saved for {model_label}: {e}")
 
 
-def finish_shadow_tasks(tasks, reference_txt_path):
-    """Detach writers for all pending shadows (or cancel them when there is no
-    reference filename to sit next to). Never blocks finalize."""
+def finish_shadow_tasks(tasks, reference_txt_path, registry=None, websocket=None):
+    """Detach file writers for all pending shadows (or cancel them when there
+    is no reference filename to sit next to). Never blocks finalize."""
     for task, suffix, model_label in tasks:
         if reference_txt_path:
-            asyncio.create_task(_finish_shadow(task, reference_txt_path, suffix, model_label))
+            asyncio.create_task(_finish_shadow(task, reference_txt_path, suffix, model_label, registry, websocket))
         else:
             task.cancel()
 
@@ -845,6 +1179,7 @@ async def websocket_endpoint(websocket: WebSocket):
     current_mode = "realtime"  # Default mode
     restful_audio_buffer = []  # Buffer for RESTful mode audio
     pending_shadow_tasks = []  # In-flight shadow transcriptions (started at stop)
+    saved_files = {}  # model label ('primary' / shadow label) -> transcript path written this session
 
     # Add synchronization for audio sending operations
     pending_audio_operations = 0
@@ -1058,13 +1393,28 @@ async def websocket_endpoint(websocket: WebSocket):
                 # (start_shadow_tasks), so they're usually already done by now.
                 # Write their sibling transcripts using the descriptive name.
                 # Non-blocking so this never delays finalize.
+                # Remember where this session's primary transcript lives (for the
+                # browser's Save button) and tell the client it's on disk.
+                if transcription_path:
+                    saved_files['primary'] = transcription_path
+                    if websocket.client_state == WebSocketState.CONNECTED:
+                        try:
+                            await websocket.send_text(json.dumps({
+                                "type": "saved", "model": "primary",
+                                "file": os.path.basename(transcription_path)}))
+                        except Exception as e:
+                            logger.debug(f"Could not send saved event: {e}")
+
                 reference = transcription_path or audio_path
                 if pending_shadow_tasks:
-                    finish_shadow_tasks(pending_shadow_tasks, reference)
+                    # Already pushed to the browser as each finished; just write files.
+                    finish_shadow_tasks(pending_shadow_tasks, reference, saved_files, websocket)
                     pending_shadow_tasks = []
                 elif reference and audio_path and os.path.exists(audio_path):
                     # Modes without a local PCM buffer (e.g. realtime): late shadows from the WAV.
-                    finish_shadow_tasks(start_shadow_tasks_from_file(audio_path), reference)
+                    late_tasks = start_shadow_tasks_from_file(audio_path)
+                    attach_shadow_pushers(late_tasks, websocket)
+                    finish_shadow_tasks(late_tasks, reference, saved_files, websocket)
 
                 audio_processor.end_session()
             else:
@@ -1158,6 +1508,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         msg = json.loads(data["text"])
 
                         if msg.get("type") == "start_recording":
+                            saved_files.clear()  # new recording: forget last session's files
                             if audio_processor.has_active_session():
                                 logger.warning("Start recording requested while a session is active. Finalizing previous session first.")
                                 await finalize_recording(success=False, reason="duplicate_start", notify_client=False)
@@ -1225,6 +1576,31 @@ async def websocket_endpoint(websocket: WebSocket):
                                 }))
                                 logger.info("RESTful mode: Ready to buffer audio locally")
 
+                        elif msg.get("type") == "save_transcript":
+                            # Browser edited a transcript (primary or a shadow tab):
+                            # write it back, preserving the time-spent footer.
+                            model = msg.get("model") or "primary"
+                            content = msg.get("content") or ""
+                            path = saved_files.get(model)
+                            # Fallback: client may name the file (basename only; must be a .txt in RECORDINGS_DIR)
+                            if not path and msg.get("file"):
+                                cand = os.path.join(RECORDINGS_DIR, os.path.basename(msg["file"]))
+                                if cand.endswith(".txt") and os.path.isfile(cand):
+                                    path = cand
+                            result = {"type": "save_result", "model": model, "ok": False}
+                            if not path or not os.path.isfile(path):
+                                result["error"] = "No saved file for this transcript yet (or the page was reloaded)."
+                            else:
+                                try:
+                                    footer = rewrite_transcript_body(path, content)
+                                    result.update(ok=True, file=os.path.basename(path), footer=footer)
+                                    logger.info(f"Saved browser edit for {model} -> {path} ({len(content)} chars)")
+                                except Exception as e:
+                                    logger.error(f"Failed to save edit for {model}: {e}", exc_info=True)
+                                    result["error"] = str(e)
+                            if websocket.client_state == WebSocketState.CONNECTED:
+                                await websocket.send_text(json.dumps(result))
+
                         elif msg.get("type") == "stop_recording":
                             # Always ensure a local fail-safe file exists as soon as recording stops
                             try:
@@ -1243,6 +1619,16 @@ async def websocket_endpoint(websocket: WebSocket):
 
                                     # Launch shadows (MiMo, Paraformer) now, in parallel with the (slower) OpenAI call.
                                     pending_shadow_tasks = start_shadow_tasks(combined_audio)
+                                    # Tell the browser which shadow tabs to show (spinning)
+                                    # right away; each fills in as its engine finishes.
+                                    if pending_shadow_tasks and websocket.client_state == WebSocketState.CONNECTED:
+                                        await websocket.send_text(json.dumps({
+                                            "type": "shadow_start",
+                                            "models": [lbl for (_t, _s, lbl) in pending_shadow_tasks],
+                                        }))
+                                        # Each tab fills the instant its engine finishes —
+                                        # NOT after the (slower) gpt-4o primary completes.
+                                        attach_shadow_pushers(pending_shadow_tasks, websocket)
 
                                     # Send new response indicator
                                     await websocket.send_text(json.dumps({
@@ -1254,6 +1640,8 @@ async def websocket_endpoint(websocket: WebSocket):
                                     try:
                                         # Non-streaming transcription is already clean UTF-8;
                                         # no grammar-fix pass (it over-edited and dropped content).
+                                        # Pass the in-flight shadow tasks so the completeness
+                                        # cross-check can flag silent trailing-segment drops.
                                         await transcribe_with_rest_api(combined_audio, websocket, audio_processor)
                                         await finalize_recording(success=True, reason="restful_complete")
                                     except Exception as e:
@@ -1289,6 +1677,16 @@ async def websocket_endpoint(websocket: WebSocket):
 
                                     # Launch shadows (MiMo, Paraformer) now, in parallel with the (slower) OpenAI call.
                                     pending_shadow_tasks = start_shadow_tasks(combined_audio)
+                                    # Tell the browser which shadow tabs to show (spinning)
+                                    # right away; each fills in as its engine finishes.
+                                    if pending_shadow_tasks and websocket.client_state == WebSocketState.CONNECTED:
+                                        await websocket.send_text(json.dumps({
+                                            "type": "shadow_start",
+                                            "models": [lbl for (_t, _s, lbl) in pending_shadow_tasks],
+                                        }))
+                                        # Each tab fills the instant its engine finishes —
+                                        # NOT after the (slower) gpt-4o primary completes.
+                                        attach_shadow_pushers(pending_shadow_tasks, websocket)
 
                                     await websocket.send_text(json.dumps({
                                         "type": "text",

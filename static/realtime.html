@@ -34,9 +34,24 @@
             <input type="file" id="fileInput" accept=".wav" style="display: none;">
             <input type="file" id="whisperFileInput" accept=".wav" style="display: none;">
         </div>
-        <div class="transcript-container">
-            <textarea id="transcript"></textarea>
-            <button id="copyButton" class="copy-button">Copy</button>
+        <div class="transcript-row">
+            <div class="transcript-container">
+                <textarea id="transcript"></textarea>
+                <button id="copyButton" class="copy-button">Copy</button>
+                <button id="saveButton" class="save-button" title="Write your edits back to the transcript file (footer with time-spent is kept)">Save</button>
+                <span id="saveStatus" class="save-status"></span>
+            </div>
+            <!-- Shadow ASR engines: one tab per engine. Tabs spin until that
+                 engine's batch transcript arrives, then become selectable. -->
+            <div class="shadow-container" id="shadowContainer" hidden>
+                <div class="shadow-tabs" id="shadowTabs" role="tablist"></div>
+                <div class="shadow-body">
+                    <textarea id="shadowTranscript" placeholder="Shadow transcripts appear here as each model finishes. Editable — Save writes back to that model's .txt."></textarea>
+                    <button id="copyShadowButton" class="copy-button">Copy</button>
+                    <button id="saveShadowButton" class="save-button" title="Write your edits to this tab's transcript file (footer with time-spent is kept)">Save</button>
+                    <span id="saveShadowStatus" class="save-status"></span>
+                </div>
+            </div>
         </div>
         <div class="button-container">
             <button id="readabilityButton" class="action-button">Readability</button>

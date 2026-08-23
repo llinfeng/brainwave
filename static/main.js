@@ -107,6 +107,169 @@ const whisperUploadButton = document.getElementById('whisperUploadButton');
 const fileInput = document.getElementById('fileInput');
 const whisperFileInput = document.getElementById('whisperFileInput');
 const transcript = document.getElementById('transcript');
+
+// ---- Shadow ASR tabs ------------------------------------------------------
+// One tab per shadow engine. On Stop the server sends `shadow_start` with the
+// engine list: every tab appears immediately with its name + a spinner. Each
+// `shadow` event fills one tab (spinner removed, tab becomes selectable).
+// The first engine in the list (Qwen realtime) is the default-selected tab.
+const shadowContainer = document.getElementById('shadowContainer');
+const shadowTabs = document.getElementById('shadowTabs');
+const shadowTranscript = document.getElementById('shadowTranscript');
+const copyShadowButton = document.getElementById('copyShadowButton');
+const shadowState = { models: [], text: {}, done: {}, elapsed: {}, file: {}, dirty: {}, active: null };
+
+function renderShadowTabs() {
+    shadowTabs.innerHTML = '';
+    shadowState.models.forEach((model) => {
+        const tab = document.createElement('div');
+        tab.className = 'shadow-tab';
+        tab.setAttribute('role', 'tab');
+        const done = !!shadowState.done[model];
+        const empty = done && !shadowState.text[model];
+        if (!done) tab.classList.add('loading');
+        if (empty) tab.classList.add('empty');
+        if (model === shadowState.active) tab.classList.add('active');
+
+        const name = document.createElement('span');
+        name.textContent = model;
+        tab.appendChild(name);
+
+        if (!done) {
+            const spin = document.createElement('span');
+            spin.className = 'shadow-spinner';
+            spin.title = 'transcribing…';
+            tab.appendChild(spin);
+        } else {
+            const meta = document.createElement('span');
+            meta.className = 'shadow-elapsed';
+            const el = shadowState.elapsed[model];
+            meta.textContent = empty ? '(no output)' : (el != null ? `${el}s` : '✓');
+            tab.appendChild(meta);
+        }
+        // Only finished tabs can be switched to.
+        if (done) tab.onclick = () => selectShadowTab(model);
+        shadowTabs.appendChild(tab);
+    });
+}
+
+function selectShadowTab(model) {
+    shadowState.active = model;
+    shadowTranscript.value = shadowState.text[model] || '';
+    shadowTranscript.scrollTop = 0;
+    renderShadowTabs();
+}
+
+function startShadowTabs(models) {
+    shadowState.models = models.slice();
+    shadowState.text = {};
+    shadowState.done = {};
+    shadowState.elapsed = {};
+    shadowState.file = {};
+    shadowState.dirty = {};
+    shadowState.active = models[0] || null;   // Qwen realtime first by default
+    shadowTranscript.value = '';
+    shadowContainer.hidden = models.length === 0;
+    renderShadowTabs();
+}
+
+function receiveShadow(model, content, elapsed) {
+    if (!shadowState.models.includes(model)) shadowState.models.push(model);
+    shadowState.text[model] = content || '';
+    shadowState.done[model] = true;
+    shadowState.elapsed[model] = elapsed;
+    shadowContainer.hidden = false;
+    // If the active tab is this one (e.g. the default), show its text now.
+    if (shadowState.active === model) shadowTranscript.value = content || '';
+    // If no tab is active yet, or the default tab produced nothing, fall
+    // back to the first engine that actually returned text.
+    if (!shadowState.active || (shadowState.done[shadowState.active] && !shadowState.text[shadowState.active] && content)) {
+        selectShadowTab(model);
+        return;
+    }
+    renderShadowTabs();
+}
+
+copyShadowButton.onclick = () => copyToClipboard(shadowTranscript.value, copyShadowButton);
+
+// ---- Save edits back to the transcript files ------------------------------
+// Both the main transcript and every shadow tab are editable. Save sends the
+// edited body to the server, which rewrites ONLY the body and keeps the
+// footer (`_Transcribed by: <model> in N.Ns_`) so the time-spent record survives.
+let primaryFile = null;   // basename of this session's primary .txt (from the 'saved' event)
+const saveButton = document.getElementById('saveButton');
+const saveShadowButton = document.getElementById('saveShadowButton');
+
+function flashButton(btn, msg, ok = true) {
+    const original = btn.textContent;
+    btn.textContent = msg;
+    if (!ok) btn.style.background = '#b91c1c';
+    setTimeout(() => { btn.textContent = original; btn.style.background = ''; }, 2000);
+}
+
+function sendSave(model, content, file) {
+    ws.send(JSON.stringify({ type: 'save_transcript', model, content, file }));
+}
+
+// Save status indicators (next to each Save button).
+const saveStatus = document.getElementById('saveStatus');
+const saveShadowStatus = document.getElementById('saveShadowStatus');
+function setStatus(el, text, cls) {
+    el.textContent = text;
+    el.className = 'save-status' + (cls ? ' ' + cls : '');
+}
+const nowHHMM = () => new Date().toTimeString().slice(0, 5);
+
+// Dirty tracking: only panes the user actually edited get written.
+let primaryDirty = false;
+let autosaveTimer = null;
+const AUTOSAVE_DELAY_MS = 2000;   // write ~2 s after typing stops
+function scheduleAutosave() {
+    clearTimeout(autosaveTimer);
+    autosaveTimer = setTimeout(() => saveAll(null, /*auto*/ true), AUTOSAVE_DELAY_MS);
+}
+transcript.oninput = () => {
+    primaryDirty = true;
+    setStatus(saveStatus, 'Unsaved changes', 'dirty');
+    scheduleAutosave();
+};
+// Keep per-tab edits when switching tabs, and mark that tab dirty.
+shadowTranscript.oninput = () => {
+    const m = shadowState.active;
+    if (!m) return;
+    shadowState.text[m] = shadowTranscript.value;
+    shadowState.dirty[m] = true;
+    setStatus(saveShadowStatus, 'Unsaved changes', 'dirty');
+    scheduleAutosave();
+};
+// Leaving a pane flushes immediately (don't wait for the timer).
+transcript.onblur = () => { if (primaryDirty) saveAll(null, true); };
+shadowTranscript.onblur = () => { if (shadowState.active && shadowState.dirty[shadowState.active]) saveAll(null, true); };
+
+// Saves EVERYTHING with unsaved edits: the primary transcript and every shadow
+// tab you touched — not just the visible pane. Triggered by autosave, by pane
+// blur, or by either Save button (manual).
+function saveAll(btn, auto = false) {
+    clearTimeout(autosaveTimer);
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+        if (!auto) alert('Not connected to the server — cannot save.');
+        return;
+    }
+    if (shadowState.active) shadowState.text[shadowState.active] = shadowTranscript.value;
+    const jobs = [];
+    if (primaryDirty) jobs.push(['primary', transcript.value, primaryFile]);
+    for (const m of shadowState.models) {
+        if (shadowState.dirty[m]) jobs.push([m, shadowState.text[m] || '', shadowState.file[m]]);
+    }
+    if (jobs.length === 0) { if (btn) flashButton(btn, 'No changes'); return; }
+    for (const [model, content, file] of jobs) {
+        setStatus(model === 'primary' ? saveStatus : saveShadowStatus, 'Saving…', 'saving');
+        sendSave(model, content, file);
+    }
+    console.log(`[save] ${auto ? 'auto' : 'manual'} writing`, jobs.map(j => j[0]));
+}
+saveButton.onclick = () => saveAll(saveButton);
+saveShadowButton.onclick = () => saveAll(saveShadowButton);
 const enhancedTranscript = document.getElementById('enhancedTranscript');
 const copyButton = document.getElementById('copyButton');
 const copyEnhancedButton = document.getElementById('copyEnhancedButton');
@@ -555,6 +718,38 @@ function initializeWebSocket() {
                 console.log("Server requested audio cleanup");
                 cleanupAudioResources();
                 break;
+            case 'shadow_start':
+                // Shadow engines launched: show every tab spinning right away.
+                console.log('[shadow] start, engines:', data.models);
+                startShadowTabs(data.models || []);
+                break;
+            case 'shadow':
+                // One shadow engine finished: fill its tab, drop the spinner.
+                console.log(`[shadow] ${data.model} done in ${data.elapsed}s, ${(data.content || '').length} chars`);
+                receiveShadow(data.model, data.content, data.elapsed);
+                break;
+            case 'saved':
+                // Primary transcript is on disk; remember its file for Save.
+                primaryFile = data.file;
+                break;
+            case 'shadow_saved':
+                // A shadow tab's .txt is on disk; remember its file for Save.
+                shadowState.file[data.model] = data.file;
+                break;
+            case 'save_result': {
+                const btn = data.model === 'primary' ? saveButton : saveShadowButton;
+                const statusEl = data.model === 'primary' ? saveStatus : saveShadowStatus;
+                if (data.ok) {
+                    if (data.model === 'primary') primaryDirty = false; else shadowState.dirty[data.model] = false;
+                    const who = data.model === 'primary' ? '' : ` (${data.model.split('-')[0]})`;
+                    setStatus(statusEl, `Saved ${nowHHMM()} ✓${who}`, 'saved');
+                    console.log(`[save] ${data.model} -> ${data.file} | footer: ${data.footer}`);
+                } else {
+                    setStatus(statusEl, 'Save failed — ' + data.error, 'failed');
+                    flashButton(btn, 'Failed', false);
+                }
+                break;
+            }
         }
     };
     
@@ -579,6 +774,11 @@ function initializeWebSocket() {
 // Recording control
 async function startRecording() {
     if (isRecording) return;
+    primaryFile = null;   // new recording: the previous session's file is no longer the target
+    primaryDirty = false;
+    clearTimeout(autosaveTimer);
+    setStatus(saveStatus, '', '');
+    setStatus(saveShadowStatus, '', '');
 
     try {
         // Ensure WebSocket is connected before starting
